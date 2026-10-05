@@ -457,7 +457,7 @@
     <div><kbd>A</kbd> / <kbd>D</kbd> 旋回　<kbd>W</kbd> / <kbd>S</kbd> 上昇・下降</div>
     <div><kbd>Space</kbd> はばたく（空中で連打すると加速）　<kbd>E</kbd> 歌う</div>
     <div>ドラッグ 視点　ホイール 寄る・引く</div>
-    <div><kbd>P</kbd> 写真　<kbd>R</kbd> 休みの岩へ</div>
+    <div><kbd>P</kbd> 写真　<kbd>R</kbd> <span id="kRescueName">休みの岩</span>へ</div>
   </div>
 </div>
 <div id="touch">
@@ -479,9 +479,9 @@
     <label class="row"><span>BGM</span><span class="sw"><input type="checkbox" id="sBgm" checked><i></i></span></label>
     <label class="row" style="display:none"><span>デバッグ表示<small>速度・高度・モーション名（H キー）</small></span><span class="sw"><input type="checkbox" id="sDebug"><i></i></span></label>
     <h3 class="sub">困ったとき</h3>
-    <div class="row"><span>休みの岩へ戻る<small>群れごと降りる（R キー）</small></span><button id="sRescue" class="zlink small">戻る</button></div>
-    <div class="row"><span>最初からやり直す<small>仲間もはぐれ鳥も元に戻る</small></span><button id="sRestart" class="zlink small">やり直す</button></div>
-    <div id="sRestartAsk" class="row ask"><span>今日の群れがほどけます。やり直しますか？</span><span><button id="sRestartNo" class="zlink small">やめる</button> <button id="sRestartYes" class="zlink small danger">やり直す</button></span></div>
+    <div class="row"><span><span id="sRescueName">休みの岩</span>へ戻る<small>群れごと降りる（R キー）</small></span><button id="sRescue" class="zlink small">戻る</button></div>
+    <div class="row"><span>タイトルに戻る<small>別の日を選ぶ・図鑑を見る</small></span><button id="sRestart" class="zlink small">戻る</button></div>
+    <div id="sRestartAsk" class="row ask"><span>今日の群れがほどけます。タイトルに戻りますか？</span><span><button id="sRestartNo" class="zlink small">やめる</button> <button id="sRestartYes" class="zlink small danger">戻る</button></span></div>
   </div>
 </div>
 <div id="err"></div>
@@ -500,6 +500,7 @@ THREE.ShaderChunk.fog_fragment = `#ifdef USE_FOG
 #endif`;
 import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
 import {clone as skinClone} from 'three/addons/utils/SkeletonUtils.js';
+import {mergeGeometries} from 'three/addons/utils/BufferGeometryUtils.js';
 
 const $ = id => document.getElementById(id);
 
@@ -640,6 +641,7 @@ function updateShadows(){
   if(model) add(bird.position.x, bird.position.y, bird.position.z, wingspan*.68);
   for(const m of mates){ if(m.g.visible) add(m.g.position.x, m.g.position.y, m.g.position.z, wingspan*.64*(m.def.size||1)); }
   if(escort && escort.g.visible) add(escort.g.position.x, escort.g.position.y, escort.g.position.z, wingspan*.68*ESCORT.size);
+  for(const h of hawks) if(h.state !== 'away') add(h.g.position.x, h.g.position.y, h.g.position.z, wingspan*1.7);
   _shList.sort((a,b)=>a.d-b.d);
   const u = shadowU.uShadows.value;
   for(let i=0;i<SHADOW_N;i++){
@@ -705,7 +707,7 @@ function makeStoneMat(){
   m.onBeforeCompile = sh=>{
     Object.assign(sh.uniforms, stoneU, shadowU);
     sh.vertexShader = 'varying vec3 vTriPos;\n' + sh.vertexShader.replace('#include <project_vertex>',
-      '#include <project_vertex>\n  vTriPos = (modelMatrix*vec4(transformed,1.0)).xyz;');
+      '#include <project_vertex>\n#ifdef USE_INSTANCING\n  vTriPos = (modelMatrix*instanceMatrix*vec4(transformed,1.0)).xyz;\n#else\n  vTriPos = (modelMatrix*vec4(transformed,1.0)).xyz;\n#endif');
     sh.fragmentShader = SHADOW_GLSL + `
 varying vec3 vTriPos;
 uniform sampler2D tRock, tMoss, tRockH, tMossN; vec3 mossWN = vec3(0.); float mossKK = 0.; uniform float uTriScale, uMossLo, uMossHi, uMossAmt, uBump, uMossBump;
@@ -745,72 +747,164 @@ vec3 triPerturb(vec3 sp, vec3 sn, vec2 dH, float fd){
   return m;
 }
 
-const stage = (()=>{
+/* ============ shared scenery builders (sea, mountain) ============ */
+/* ---- sky: gradient dome with a soft wash, rides with the camera ---- */
+function makeSky(S, sunDir){
+  const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(1600, 32, 16),
+  new THREE.ShaderMaterial({
+    side:THREE.BackSide, depthWrite:false, fog:false,
+    uniforms:{ uTop:{value:srgb(S.skyTop)}, uBot:{value:srgb(S.skyBottom)},
+               uGlow:{value:srgb(S.glow)}, uSun:{value:sunDir} },
+    vertexShader:`varying vec3 vW;
+      void main(){ vW=(modelMatrix*vec4(position,1.)).xyz; gl_Position=projectionMatrix*viewMatrix*vec4(vW,1.); }`,
+    fragmentShader:`varying vec3 vW; uniform vec3 uTop,uBot,uGlow,uSun;
+      ${GLSL_NOISE}
+      void main(){
+        vec3 d=normalize(vW-cameraPosition);
+        float h=max(d.y,0.);
+        vec3 col=mix(uBot,uTop,smoothstep(.0,.5,pow(h,.8)));
+        float s=max(dot(d,uSun),0.);
+        col=mix(col,uGlow,pow(s,6.)*.55*(1.-smoothstep(.0,.7,h)));
+        // uneven wash. fed the heading as a point on a circle, not an angle:
+        // atan() jumps from +pi to -pi due west and the noise tore there
+        vec2 hd=normalize(d.xz+vec2(1e-5));
+        float w=fbm(hd*2.6 + vec2(h*5., -h*3.));
+        col*=.975+.05*w;
+        gl_FragColor=vec4(col,1.);
+      }`
+  })
+);
+  sky.renderOrder = -2;
+  return sky;
+}
+
+/* ---- hills: layered silhouettes ringing the horizon ---- */
+function makeHills(S){
+const hills = new THREE.Group();
+const fogC = new THREE.Color(S.fog);
+for(const L of S.hills){
+  const N = 420, pos=[], col=[], idx=[];
+  const top = new THREE.Color(L.col), bot = top.clone().lerp(fogC,.55);
+  for(let i=0;i<=N;i++){
+    const a = i/N*Math.PI*2;
+    let n = 0.55*Math.sin(a*3+L.seed) + 0.30*Math.sin(a*7+L.seed*2.3)
+          + 0.18*Math.sin(a*13+L.seed*5.1) + 0.07*Math.sin(a*29+L.seed*9.7);
+    n = Math.max(0, n*0.5+0.5+L.bias);
+    const h = L.h * Math.pow(n,1.4) + 2;
+    const x = Math.cos(a)*L.r, z = Math.sin(a)*L.r;
+    pos.push(x,h,z, x,-60,z);
+    col.push(top.r,top.g,top.b, bot.r,bot.g,bot.b);
+    if(i<N){ const k=i*2; idx.push(k,k+1,k+2, k+1,k+3,k+2); }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col,3));
+  g.setIndex(idx);
+  const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({vertexColors:true, fog:false, side:THREE.DoubleSide}));
+  m.renderOrder = -1;
+  hills.add(m);
+}
+return hills;
+}
+
+/* ---- clouds: painted washes. built as raw pixels, not canvas
+   gradients: iOS stores near-transparent canvas pixels premultiplied and
+   un-premultiplies them into rainbow speckle. ---- */
+function makeCloudMats(color, n=4, fog=true){
+const cloudMats = [];
+const cn = (x,y,sd)=>{            // cheap value-noise fbm for the bitmap
+  let v=0,a=.5,f=1;
+  for(let o=0;o<4;o++){
+    const X=x*f+sd*13.1, Y=y*f+sd*7.7, xi=Math.floor(X), yi=Math.floor(Y);
+    const fx=X-xi, fy=Y-yi, u=fx*fx*(3-2*fx), w=fy*fy*(3-2*fy);
+    const h=(p,q)=>{ const t=Math.sin(p*127.1+q*311.7)*43758.5453; return t-Math.floor(t); };
+    v+=a*((h(xi,yi)*(1-u)+h(xi+1,yi)*u)*(1-w)+(h(xi,yi+1)*(1-u)+h(xi+1,yi+1)*u)*w);
+    a*=.5; f*=2;
+  }
+  return v;
+};
+for(let k=0;k<n;k++){
+  const W=256,H=128, px=new Uint8Array(W*H*4);
+  // each shape its own: a second mass set off to one side, and how flat the whole wash is
+  const hs=(q)=>{ const t=Math.sin((k+1)*91.7+q*37.3)*43758.5453; return t-Math.floor(t); };
+  const ox=(hs(1)-.5)*1.1, oy=-.05-hs(2)*.25, sq=.75+hs(3)*.6, lump=k<4 ? 0 : .25+hs(4)*.35;
+  for(let y=0;y<H;y++) for(let x=0;x<W;x++){
+    const nx=(x-W/2)/(W/2), ny=(y-H*.62)/(H*.5);
+    // flat-bottomed, lumpy-topped mass
+    let body = 1 - (nx*nx + (ny<0? ny*ny*.9*sq : ny*ny*4.0));
+    if(lump) body = Math.max(body, lump + .5 - ((nx-ox)*(nx-ox)*2.2 + (ny-oy)*(ny-oy)*3.5));
+    body += (cn(x/40,y/40,k)-.5)*1.1;
+    const d = Math.min(1, Math.max(0, body*2.2));
+    // watercolour: pigment gathers at the edge of the wash
+    const rim = Math.max(0, 1-Math.abs(body-.08)/.08);
+    // fade to nothing at the bitmap border: the noise can push the wash out
+    // to the edge, and without this the sprite shows as a hard straight cut
+    const ex = Math.min(x, W-1-x)/(W*.12), ey = Math.min(y, H-1-y)/(H*.12);
+    const edge = Math.min(1, ex)*Math.min(1, ey);
+    const al = (d*.55 + rim*.25) * edge*edge*(3-2*edge);
+    const shade = 1 - rim*.08 - Math.max(0,ny)*.06;   // bellies a touch darker
+    const o=((H-1-y)*W+x)*4;   // DataTexture row 0 is the bottom
+    px[o]=255*shade; px[o+1]=250*shade; px[o+2]=240*shade; px[o+3]=Math.min(255,al*255);
+  }
+  const t=new THREE.DataTexture(px,W,H); t.colorSpace=THREE.SRGBColorSpace;
+  t.magFilter=THREE.LinearFilter; t.minFilter=THREE.LinearFilter; t.needsUpdate=true;
+  cloudMats.push(new THREE.SpriteMaterial({map:t, color, transparent:true, depthWrite:false, opacity:.85, fog}));
+}
+return cloudMats;
+}
+/* clouds strewn over an area: sizes from small puffs to big banks (most of them small), each its
+   own shape, flipped, stretched, and kept apart so they never pile up into one grey wall.
+   the scene fog stays off them: a far cloud fades out into the sky itself instead of turning
+   the fog's one flat colour, which sat grey against the sky's glow (see cloudTick) */
+function scatterClouds(root, mats, o){
+  const out = [];
+  for(let tries=0; out.length<o.n && tries<o.n*40; tries++){
+    const [x, z] = o.at(), w = o.wMin + (o.wMax-o.wMin)*Math.pow(o.rnd(), 1.8), h = w*(.32 + o.rnd()*.3);
+    // room round every cloud: its own half-width, the other's, and a gap of sky between
+    if(out.some(c=>Math.hypot(c.position.x-x, c.position.z-z) < (Math.abs(c.scale.x)+w)*.5 + o.gap)) continue;
+    const c = new THREE.Sprite(mats[Math.floor(o.rnd()*mats.length)].clone());
+    c.position.set(x, o.yMin + o.rnd()*(o.yMax-o.yMin), z);
+    c.scale.set(o.rnd()<.5 ? -w : w, h, 1);
+    c.userData.v = o.vMin + o.rnd()*(o.vMax-o.vMin); c.userData.op = c.material.opacity;
+    root.add(c); out.push(c);
+  }
+  return out;
+}
+// drift, wrap round the area, and fade: out with distance (into the sky), and out when the camera is inside it
+function cloudTick(clouds, dt, cam, fade0, fade1, x0, x1){
+  const sm = THREE.MathUtils.smoothstep;
+  for(const c of clouds){
+    c.position.x += c.userData.v*dt;
+    if(c.position.x > x1) c.position.x -= x1 - x0;
+    const d = c.position.distanceTo(cam.position), w = Math.abs(c.scale.x);
+    c.material.opacity = c.userData.op * (1 - sm(d, fade0, fade1)) * sm(d, w*.25, w*.7);
+  }
+}
+/* a soft disc bitmap: shadows, droplets */
+const dotTex = (size, fn)=>{
+  const px=new Uint8Array(size*size*4);
+  for(let y=0;y<size;y++) for(let x=0;x<size;x++){
+    const d=Math.hypot(x-size/2+.5, y-size/2+.5)/(size/2);
+    const [r,g,b,a]=fn(d); const o=(y*size+x)*4;
+    px[o]=r; px[o+1]=g; px[o+2]=b; px[o+3]=a;
+  }
+  const t=new THREE.DataTexture(px,size,size); t.magFilter=t.minFilter=THREE.LinearFilter;
+  t.colorSpace=THREE.SRGBColorSpace; t.needsUpdate=true; return t;
+};
+
+const seaStage = (()=>{
   const S = STAGES.sea;
+  const root = new THREE.Group(); root.visible = false; scene.add(root);
   const sunDir = new THREE.Vector3(...S.sun).normalize();
 
-  scene.background = new THREE.Color(S.fog);
-  scene.fog = new THREE.Fog(S.fog, S.fogNear, S.fogFar);
 
   const sun = new THREE.DirectionalLight(S.sunColor, S.sunI);
   sun.position.copy(sunDir).multiplyScalar(100);
-  scene.add(sun, new THREE.HemisphereLight(S.hemiSky, S.hemiGround, S.hemiI));
+  root.add(sun, new THREE.HemisphereLight(S.hemiSky, S.hemiGround, S.hemiI));
 
-  /* ---- sky: gradient dome with a soft wash, rides with the camera ---- */
-  const sky = new THREE.Mesh(
-    new THREE.SphereGeometry(1600, 32, 16),
-    new THREE.ShaderMaterial({
-      side:THREE.BackSide, depthWrite:false, fog:false,
-      uniforms:{ uTop:{value:srgb(S.skyTop)}, uBot:{value:srgb(S.skyBottom)},
-                 uGlow:{value:srgb(S.glow)}, uSun:{value:sunDir} },
-      vertexShader:`varying vec3 vW;
-        void main(){ vW=(modelMatrix*vec4(position,1.)).xyz; gl_Position=projectionMatrix*viewMatrix*vec4(vW,1.); }`,
-      fragmentShader:`varying vec3 vW; uniform vec3 uTop,uBot,uGlow,uSun;
-        ${GLSL_NOISE}
-        void main(){
-          vec3 d=normalize(vW-cameraPosition);
-          float h=max(d.y,0.);
-          vec3 col=mix(uBot,uTop,smoothstep(.0,.5,pow(h,.8)));
-          float s=max(dot(d,uSun),0.);
-          col=mix(col,uGlow,pow(s,6.)*.55*(1.-smoothstep(.0,.7,h)));
-          // uneven wash. fed the heading as a point on a circle, not an angle:
-          // atan() jumps from +pi to -pi due west and the noise tore there
-          vec2 hd=normalize(d.xz+vec2(1e-5));
-          float w=fbm(hd*2.6 + vec2(h*5., -h*3.));
-          col*=.975+.05*w;
-          gl_FragColor=vec4(col,1.);
-        }`
-    })
-  );
-  sky.renderOrder = -2;
-  scene.add(sky);
-
-  /* ---- hills: layered silhouettes ringing the horizon ---- */
-  const hills = new THREE.Group();
-  const fogC = new THREE.Color(S.fog);
-  for(const L of S.hills){
-    const N = 420, pos=[], col=[], idx=[];
-    const top = new THREE.Color(L.col), bot = top.clone().lerp(fogC,.55);
-    for(let i=0;i<=N;i++){
-      const a = i/N*Math.PI*2;
-      let n = 0.55*Math.sin(a*3+L.seed) + 0.30*Math.sin(a*7+L.seed*2.3)
-            + 0.18*Math.sin(a*13+L.seed*5.1) + 0.07*Math.sin(a*29+L.seed*9.7);
-      n = Math.max(0, n*0.5+0.5+L.bias);
-      const h = L.h * Math.pow(n,1.4) + 2;
-      const x = Math.cos(a)*L.r, z = Math.sin(a)*L.r;
-      pos.push(x,h,z, x,-60,z);
-      col.push(top.r,top.g,top.b, bot.r,bot.g,bot.b);
-      if(i<N){ const k=i*2; idx.push(k,k+1,k+2, k+1,k+3,k+2); }
-    }
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
-    g.setAttribute('color', new THREE.Float32BufferAttribute(col,3));
-    g.setIndex(idx);
-    const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({vertexColors:true, fog:false, side:THREE.DoubleSide}));
-    m.renderOrder = -1;
-    hills.add(m);
-  }
-  scene.add(hills);
+  const sky = makeSky(S, sunDir); root.add(sky);
+  const hills = makeHills(S); root.add(hills);
 
   /* ---- sea: flat, world-space watercolour that scrolls under the bird,
      so the pattern itself reads speed and altitude.
@@ -991,7 +1085,7 @@ const stage = (()=>{
   });
   const sea = new THREE.Mesh(new THREE.PlaneGeometry(3200,3200), seaMat);
   sea.rotation.x = -Math.PI/2;
-  scene.add(sea);
+  root.add(sea);
 
   /* ---- ripple sim: a damped wave equation on a 96x96 grid, run on the
      CPU (9k cells, far cheaper than a GPU pass and needs no float render
@@ -1111,7 +1205,7 @@ const stage = (()=>{
       g.add(cap); landables.push(cap);
     }
     g.position.set(x,0,z);
-    scene.add(g);
+    root.add(g);
     const sh = [x, z, w*.85];
     islets.push({g, w, h, rot:rnd()*6, k:.85+rnd()*.3, sh});
     shoals.push(sh);
@@ -1143,7 +1237,7 @@ const stage = (()=>{
   /* ---- the rock the flight starts from ---- */
   const perch = new THREE.Mesh(slabGeo(2.7, 3.8, 2.2, 3.1), rockMat);
   perch.position.y = 0.01;
-  scene.add(perch);
+  root.add(perch);
   landables.push(perch);
   const startParts = [perch];
 
@@ -1151,7 +1245,7 @@ const stage = (()=>{
   const spots = [];
   for(const [x,z,h] of S.spots){
     const p = new THREE.Mesh(slabGeo(1.55, 2.5, h+1.8, x*.13+z*.07), rockMat);
-    p.position.set(x,h,z); p.rotation.y = x*.37; scene.add(p);
+    p.position.set(x,h,z); p.rotation.y = x*.37; root.add(p);
     landables.push(p);
     spots.push({x, z, y:h+0.07, h, parts:[p]});
   }
@@ -1198,67 +1292,14 @@ const stage = (()=>{
     shalTex.needsUpdate = true;
   }
   bakeShallows();
-  scene.add(isle);
+  root.add(isle);
 
-  /* ---- clouds: painted washes. built as raw pixels, not canvas
-     gradients: iOS stores near-transparent canvas pixels premultiplied and
-     un-premultiplies them into rainbow speckle. ---- */
-  const cloudMats = [];
-  const cn = (x,y,sd)=>{            // cheap value-noise fbm for the bitmap
-    let v=0,a=.5,f=1;
-    for(let o=0;o<4;o++){
-      const X=x*f+sd*13.1, Y=y*f+sd*7.7, xi=Math.floor(X), yi=Math.floor(Y);
-      const fx=X-xi, fy=Y-yi, u=fx*fx*(3-2*fx), w=fy*fy*(3-2*fy);
-      const h=(p,q)=>{ const t=Math.sin(p*127.1+q*311.7)*43758.5453; return t-Math.floor(t); };
-      v+=a*((h(xi,yi)*(1-u)+h(xi+1,yi)*u)*(1-w)+(h(xi,yi+1)*(1-u)+h(xi+1,yi+1)*u)*w);
-      a*=.5; f*=2;
-    }
-    return v;
-  };
-  for(let k=0;k<4;k++){
-    const W=256,H=128, px=new Uint8Array(W*H*4);
-    for(let y=0;y<H;y++) for(let x=0;x<W;x++){
-      const nx=(x-W/2)/(W/2), ny=(y-H*.62)/(H*.5);
-      // flat-bottomed, lumpy-topped mass
-      let body = 1 - (nx*nx + (ny<0? ny*ny*.9 : ny*ny*4.0));
-      body += (cn(x/40,y/40,k)-.5)*1.1;
-      const d = Math.min(1, Math.max(0, body*2.2));
-      // watercolour: pigment gathers at the edge of the wash
-      const rim = Math.max(0, 1-Math.abs(body-.08)/.08);
-      // fade to nothing at the bitmap border: the noise can push the wash out
-      // to the edge, and without this the sprite shows as a hard straight cut
-      const ex = Math.min(x, W-1-x)/(W*.12), ey = Math.min(y, H-1-y)/(H*.12);
-      const edge = Math.min(1, ex)*Math.min(1, ey);
-      const al = (d*.55 + rim*.25) * edge*edge*(3-2*edge);
-      const shade = 1 - rim*.08 - Math.max(0,ny)*.06;   // bellies a touch darker
-      const o=((H-1-y)*W+x)*4;   // DataTexture row 0 is the bottom
-      px[o]=255*shade; px[o+1]=250*shade; px[o+2]=240*shade; px[o+3]=Math.min(255,al*255);
-    }
-    const t=new THREE.DataTexture(px,W,H); t.colorSpace=THREE.SRGBColorSpace;
-    t.magFilter=THREE.LinearFilter; t.minFilter=THREE.LinearFilter; t.needsUpdate=true;
-    cloudMats.push(new THREE.SpriteMaterial({map:t, color:S.cloud, transparent:true, depthWrite:false, opacity:.85}));
-  }
-  const clouds = [];
-  for(let i=0;i<40;i++){
-    const c=new THREE.Sprite(cloudMats[i%4]);
-    const a=Math.random()*Math.PI*2, r=80+Math.random()*950;
-    c.position.set(Math.cos(a)*r, 55+Math.random()*140, Math.sin(a)*r);
-    const w=60+Math.random()*110; c.scale.set(w, w*.5, 1);
-    c.userData.v = 0.6+Math.random()*0.8;       // slow drift
-    scene.add(c); clouds.push(c);
-  }
+  const cloudMats = makeCloudMats(S.cloud, 8, false);
+  const clouds = scatterClouds(root, cloudMats, {n:44, rnd:Math.random, gap:45,
+    at:()=>{ const a=Math.random()*Math.PI*2, r=80+Math.random()*950; return [Math.cos(a)*r, Math.sin(a)*r]; },
+    yMin:75, yMax:210, wMin:30, wMax:280, vMin:.6, vMax:1.4});
 
   /* ---- blob shadow: soft-edged, laid flat on whatever is below ---- */
-  const dotTex = (size, fn)=>{
-    const px=new Uint8Array(size*size*4);
-    for(let y=0;y<size;y++) for(let x=0;x<size;x++){
-      const d=Math.hypot(x-size/2+.5, y-size/2+.5)/(size/2);
-      const [r,g,b,a]=fn(d); const o=(y*size+x)*4;
-      px[o]=r; px[o+1]=g; px[o+2]=b; px[o+3]=a;
-    }
-    const t=new THREE.DataTexture(px,size,size); t.magFilter=t.minFilter=THREE.LinearFilter;
-    t.colorSpace=THREE.SRGBColorSpace; t.needsUpdate=true; return t;
-  };
   const shadowTex = dotTex(64, d=>{ const a=Math.max(0,1-d); return [47,74,72, 255*a*a*(3-2*a)]; });
   const blob = new THREE.Mesh(
     new THREE.PlaneGeometry(2,2),
@@ -1266,7 +1307,7 @@ const stage = (()=>{
       polygonOffset:true, polygonOffsetFactor:-2, polygonOffsetUnits:-2})
   );
   blob.rotation.x = -Math.PI/2;
-  scene.add(blob);
+  root.add(blob);
 
   /* ---- splash: droplets thrown up plus a ring spreading on the water ---- */
   const dropTex = dotTex(32, d=>{ const a=Math.max(0,1-d); return [255,252,244, 255*Math.min(1,a*1.6)]; });
@@ -1277,14 +1318,14 @@ const stage = (()=>{
   const drops = new THREE.Points(dropGeo, new THREE.PointsMaterial({
     map:dropTex, size:.2, transparent:true, depthWrite:false, color:0xffffff, opacity:.9}));
   drops.frustumCulled = false;
-  scene.add(drops);
+  root.add(drops);
   let dropNext = 0;
   const rings = [];
   const ringMat = ()=>new THREE.MeshBasicMaterial({color:0xf6f1e4, transparent:true, opacity:0, depthWrite:false, fog:false,
       polygonOffset:true, polygonOffsetFactor:-1, polygonOffsetUnits:-1});
   for(let k=0;k<4;k++){
     const r=new THREE.Mesh(new THREE.RingGeometry(.82,1,40), ringMat());
-    r.rotation.x=-Math.PI/2; r.visible=false; r.userData.t=1; scene.add(r); rings.push(r);
+    r.rotation.x=-Math.PI/2; r.visible=false; r.userData.t=1; root.add(r); rings.push(r);
   }
   let ringNext = 0;
   function splash(x,z,vx,vz,power){
@@ -1406,7 +1447,7 @@ const stage = (()=>{
         const bb = new THREE.Box3().setFromObject(o);
         const k = sp.h / Math.max(.1, bb.max.y);
         o.scale.multiplyScalar(k); o.position.set(sp.x, 0, sp.z); o.rotation.y = i*1.7;
-        scene.add(o); sp.parts = meshesOf(o); landables.push(...sp.parts);
+        root.add(o); sp.parts = meshesOf(o); landables.push(...sp.parts);
         o.updateMatrixWorld(true); if(sp.sh) sp.sh[2] = footR(o);
       });
     } else if(lib.m.length || lib.l.length){
@@ -1424,7 +1465,7 @@ const stage = (()=>{
             unland(sp.parts);
             const o = dressStone(src);
             o.position.set(sp.x, 0, sp.z); o.rotation.y = i*1.7;
-            scene.add(o); sp.parts = meshesOf(o); landables.push(...sp.parts);
+            root.add(o); sp.parts = meshesOf(o); landables.push(...sp.parts);
             o.updateMatrixWorld(true); if(sp.sh) sp.sh[2] = footR(o) + (i === rareI ? 0 : 1.5);
             return;
           }
@@ -1442,7 +1483,7 @@ const stage = (()=>{
         unland(sp.parts);
         const o = dressStone(best);
         o.position.set(sp.x, 0, sp.z); o.rotation.y = i*1.7;
-        scene.add(o); sp.parts = meshesOf(o); landables.push(...sp.parts);
+        root.add(o); sp.parts = meshesOf(o); landables.push(...sp.parts);
         o.updateMatrixWorld(true); if(sp.sh) sp.sh[2] = footR(o);
       });
     }
@@ -1481,13 +1522,13 @@ const stage = (()=>{
       refreshLandables();
       const ty = groundAt(tx, tz);
       tree.position.set(tx, (ty ?? (treeMark ? treeMark.y : 0)) - .3, tz);   // root it in the ground under the mark
-      scene.add(tree);
+      root.add(tree);
       for(const m of meshesOf(tree)){ m.userData.overhang = true; landables.push(m); }   // birds may perch in it, or walk under it
     }
     applyEnvTex();
     if(lib.start.length){
       unland(startParts);
-      const o = dressStone(lib.start[0]); scene.add(o);
+      const o = dressStone(lib.start[0]); root.add(o);
       startParts.length = 0; startParts.push(...meshesOf(o)); landables.push(...startParts);
     }
     refreshLandables();
@@ -1538,6 +1579,10 @@ const stage = (()=>{
 
   const lastFocus = new THREE.Vector3(), WAKE_H = 2.6;
   return {
+    root, enter(){ scene.background = new THREE.Color(S.fog); scene.fog = new THREE.Fog(S.fog, S.fogNear, S.fogFar); },
+    start:new THREE.Vector3(0,0,0), climbK:()=>1, camFloor:()=>.4, get groundWall(){ return true; }, groundWater:false, slide:false, softKnock:false, hiddenAt:()=>false, hawks:null, restName:'休みの岩', camRoom:null,
+    arriveMsg:'島に着いた。ゆっくりしたら「渡りを終える」', arriveTitle:'島に着いた', bgm:'umi',
+    rareMsg:'遠くの岩に、光る羽が舞い降りた', escortMsg:n=>`島で ${n} が待っていた。歌いかけてみよう`,
     // is there rock or island between a and b?
     blocks(a, b){
       _bv.copy(b).sub(a); const d = _bv.length(); if(d < .5) return false;
@@ -1546,6 +1591,7 @@ const stage = (()=>{
       ray.far = Infinity; return hit;
     },
     get groundUp(){ return lastNY; },
+    waterMat:seaMat,
     name:S.name, blob, splash, groundAt, spots, useProps, isleRoosts,
     get rescue(){ return rescue; }, setEnvTex,
     maxFlock:S.maxFlock, rare:S.rare,
@@ -1567,14 +1613,910 @@ const stage = (()=>{
       // flat blob, so it can ride the waves and fall on the floor in the shallows
       blob.visible = false;          // shadows are painted by the surfaces now
       fxUpdate(dt);
-      for(const c of clouds) c.position.x += c.userData.v*dt;
+      cloudTick(clouds, dt, cam, 520, 1100, -1100, 1100);
       sky.position.copy(cam.position);
       hills.position.set(cam.position.x, 0, cam.position.z);
       sea.position.set(focus.x, 0, focus.z);
     }
   };
 })();
-const blob = stage.blob;
+/* ============ mountain: 二日目・山越え ============
+   one height field: a winding valley that climbs from the foothill forest
+   to a pass between two peaks, and the goal hill with its great tree on the
+   far side, in sight from the start through the notch. the forest is one
+   model drawn many times. there is no hard ceiling: past S.cap.soft the
+   climb weakens, and at S.cap.hard it is gone, with a thin cloud layer to
+   show where. slopes slide the bird off; only rocks knock a bird loose. */
+STAGES.mountain = {
+  name:'二日目・山越え',
+  skyTop:0xa5bdd0, skyBottom:0xede4d3, glow:0xfff0d6,
+  fog:0xe4e8e2, fogNear:40, fogFar:780,            // haze from 40 m: the further, the paler
+  sun:STAGES.sea.sun, sunColor:0xfff0dc, sunI:1.7,       // same light as the sea: the painted shadows lean the same way
+  hemiSky:0xe6eef6, hemiGround:0xb8b4d6, hemiI:1.6,
+  hills:[                                                 // far -> near, cool and tall
+    {r:1560, h:1250, col:0xd2dae1, seed:2.2, bias:.35}, // furthest: palest, nearly the sky
+    {r:1440, h:1020, col:0xb2c0ca, seed:5.3, bias:.3},
+    {r:1320, h:820, col:0x93a6ac, seed:8.1, bias:.25},  // nearest ridge: darkest of the three. tall enough to rise over the world's rim
+  ],
+  start:[0,0,0], goalZ:960, passZ:650,
+  // where the lone birds wait, as (offset from the valley axis, z): the two left at the start,
+  // the forest, the wooded edge of the stream valley, the open river bed, the meadow slope, and deep in the valley for the rare one
+  spots:[[-18,-14],[32,-20],[35,150],[-55,320],[0,430],[70,520],[-30,600],[55,635]],   // 7: the golden one, on the slope before the pass
+  rare:{spot:6, minFlock:4},
+  // rising air: (offset from the axis, z, radius). the first on the meadow slope, the second just before the pass
+  thermals:[[45,385,42],[-40,590,38]],
+  // the valley mist: (z from, z to, half width). thick above the ground, thin below `low` m, and it comes and goes
+  mist:{z0:505, z1:700, halfW:170, low:9, period:52},
+  // the stream: runs down the valley floor from the mist to behind the start. its bed is pale gravel (the river bed of じょびこ)
+  stream:{z0:-330, z1:520, halfW:7, bank:20},
+  // sheer rock faces, the one thing on the mountain that knocks a bird loose: (offset from the axis, z, width, height, turn)
+  cliffs:[[-42,255,38,30,.25],[46,470,34,34,-.4],[-22,575,40,32,.1]],
+  cap:{soft:120, hard:190},                               // climb full below soft, none above hard
+  // two hawks. zone: [where they only show themselves, where they strike]. they rest on the peaks.
+  // numbers are provisional: carryTime = seconds to sing it off, scareNeed = songs heard before it flinches
+  hawks:{nests:[[-95,0,700],[140,0,790]], zone:[300,440], interval:[16,28], rest:38, grace:3, circleTime:10, carryTime:24, scareNeed:4},
+  cloud:0xfaf7f1,
+  maxFlock:6,
+  // the tree's collision shape. null = measured from the model (leaf clumps -> balls, trunk -> column).
+  // to set by hand: {spheres:[[x,y,z,r],...], rootY, trunkR} in the model's own space at scale 1
+  treeShape:null,
+};
+/* built the first time the mountain is picked, not at load: the public build (sea only) never pays for it */
+function makeMountainStage(){
+  const S = STAGES.mountain;
+  const root = new THREE.Group(); root.visible = false; scene.add(root);
+  const sunDir = new THREE.Vector3(...S.sun).normalize();
+  const sun = new THREE.DirectionalLight(S.sunColor, S.sunI);
+  sun.position.copy(sunDir).multiplyScalar(100);
+  root.add(sun, new THREE.HemisphereLight(S.hemiSky, S.hemiGround, S.hemiI));
+  const sky = makeSky(S, sunDir); root.add(sky);
+  const hills = makeHills(S); root.add(hills);
+
+  /* ---- the shape of the land ---- */
+  const smooth = (a,b,x)=>{ const k = Math.min(1, Math.max(0, (x-a)/(b-a))); return k*k*(3-2*k); };
+  const gauss = (dx,dz,sx,sz)=>Math.exp(-.5*((dx*dx)/(sx*sx) + (dz*dz)/(sz*sz)));
+  const hsh = (i,j)=>{ const t = Math.sin(i*127.1 + j*311.7)*43758.5453; return t - Math.floor(t); };
+  const vnoise = (x,z)=>{
+    const xi = Math.floor(x), zi = Math.floor(z), fx = x-xi, fz = z-zi, u = fx*fx*(3-2*fx), w = fz*fz*(3-2*fz);
+    return (hsh(xi,zi)*(1-u) + hsh(xi+1,zi)*u)*(1-w) + (hsh(xi,zi+1)*(1-u) + hsh(xi+1,zi+1)*u)*w;
+  };
+  const fbm = (x,z,oct=4)=>{ let v=0, a=.5, f=1; for(let o=0;o<oct;o++){ v += a*vnoise(x*f+o*17.3, z*f-o*9.1); a *= .5; f *= 2.03; } return v/(1-Math.pow(.5,oct)); };
+  const axisX = z => 45*Math.sin(z/260);                  // the valley winds a little
+  const GOAL = new THREE.Vector3(axisX(S.goalZ), 0, S.goalZ);
+  const SR = S.stream;
+  // the stream wanders across the valley floor: wide lazy bends in places, tighter wiggles in others
+  const streamX = z => axisX(z) + (14 + 10*Math.sin(z/170 + .5))*Math.sin(z/95 + 1) + 5*Math.sin(z/37 + 2);
+  // and it narrows and widens: about 0.6x to 1.4x of SR.halfW
+  const streamW = z => SR.halfW*(.6 + .8*(.5 + .5*Math.sin(z/63 + .8))*(.65 + .35*Math.sin(z/29)));
+  // the gravel bank's width wavers too, so its edge never runs as a clean line
+  const bankW = (x, z) => SR.bank*(.65 + .7*fbm(z*.025 + 4, x*.025 - 2, 3));
+  // 0..1 along the stream's length (fades in at the source and out behind the start)
+  const streamOn = z => smooth(SR.z0-20, SR.z0+40, z)*(1 - smooth(SR.z1-60, SR.z1, z));
+  const spots = S.spots.map(([u,z])=>({x:axisX(z)+u, z, y:0}));
+  function baseH(x, z){
+    const au = Math.abs(x - axisX(z));
+    // the floor of the valley along the route: 12 m at the start, 72 m at the pass, down to 50 m beyond
+    let floor = 12 + 24*smooth(60, 330, z) + 18*smooth(330, 520, z) + 18*smooth(520, 660, z) - 22*smooth(690, 800, z);
+    // the walls close in and grow toward the pass, then open again
+    const halfW = 150 - 80*smooth(250, 640, z) + 60*smooth(700, 900, z);
+    const wallH = 95 + 90*smooth(300, 650, z);
+    let h = floor + wallH*Math.pow(smooth(halfW*.45, halfW*2.4, au), 1.3);
+    // the two peaks either side of the pass stand above the ceiling: the way through is the pass
+    const px = axisX(S.passZ);
+    h += 170*gauss(x-(px-300), z-655, 105, 150) + 185*gauss(x-(px+305), z-640, 110, 160);
+    // the goal hill: broad and flat-topped
+    h += 90*(1 - smooth(55, 200, Math.hypot(x-GOAL.x, z-GOAL.z)));
+    // the world closes behind the start and beyond the goal
+    h += 60*smooth(-120, -420, z) + 100*smooth(1150, 1500, z);
+    h += 160*smooth(820, 1060, Math.abs(x)) + 160*smooth(-360, -480, z) + 160*smooth(1540, 1680, z);   // the rim of the world
+    // relief: broad folds that grow with height, and a fine crumple
+    h += (fbm(x*.004+3, z*.004-7)*2-1)*(8 + h*.1);
+    h += (fbm(x*.02, z*.02, 3)*2-1)*2;
+    // the waterfall's ledge: where the stream begins the valley floor steps up ~14 m, and the step
+    // fades out further up where the floor has risen to meet it
+    { const fx = Math.abs(x - streamX(SR.z1)); h += 14*smooth(518, 532, z)*(1 - smooth(560, 650, z))*(1 - smooth(30, 75, fx)); }
+    // the stream's channel: a trough a few metres deep, with a flat gravel bank either side
+    const sd = Math.abs(x - streamX(z)), son = streamOn(z);
+    if(son > 0){ const w = streamW(z), b = bankW(x, z); h -= son*(3.2*(1 - smooth(w*.6, w*2.2, sd)) + 1.2*(1 - smooth(b*.7, b*1.4, sd))); }
+    return Math.max(2, h);
+  }
+
+  /* ---- height field mesh: 10 m cells, coloured by height and slope ---- */
+  const CS = 10, NX = 220, NZ = 220, X0 = -1100, Z0 = -500;
+  const H = new Float32Array((NX+1)*(NZ+1));
+  for(let j=0;j<=NZ;j++) for(let i=0;i<=NX;i++) H[j*(NX+1)+i] = baseH(X0+i*CS, Z0+j*CS);
+  // exact height of the drawn surface (the two triangles of the cell), and its normal
+  const _tn = new THREE.Vector3();
+  function terrainAt(x, z, n){
+    // past the field the edge height holds (the rim is a wall by then), so nothing ever drops out of the world
+    const fx = Math.min(NX-.001, Math.max(0, (x-X0)/CS)), fz = Math.min(NZ-.001, Math.max(0, (z-Z0)/CS)), i = Math.floor(fx), j = Math.floor(fz);
+    const u = fx-i, v = fz-j, k = j*(NX+1)+i;
+    const h00 = H[k], h10 = H[k+1], h01 = H[k+NX+1], h11 = H[k+NX+2];
+    let h, dx, dz;
+    if(u+v <= 1){ dx = (h10-h00)/CS; dz = (h01-h00)/CS; h = h00 + dx*CS*u + dz*CS*v; }
+    else        { dx = (h11-h01)/CS; dz = (h11-h10)/CS; h = h11 - dx*CS*(1-u) - dz*CS*(1-v); }
+    if(n) n.set(-dx, 1, -dz).normalize();
+    return h;
+  }
+  GOAL.y = terrainAt(GOAL.x, GOAL.z);
+  const streamY = z => terrainAt(streamX(z), z) + 1.6;
+  for(const sp of spots){
+    // a roost the stream runs over is moved onto its gravel bank
+    const d = sp.x - streamX(sp.z), w = streamW(sp.z);
+    if(streamOn(sp.z) > .3 && Math.abs(d) < w + 4) sp.x = streamX(sp.z) + (d < 0 ? -1 : 1)*(w + 5);
+    sp.y = terrainAt(sp.x, sp.z) + .05;
+  }
+  spots.push({x:S.start[0], z:S.start[2], y:terrainAt(S.start[0], S.start[2]) + .05, home:true});
+  const C = {
+    grass:new THREE.Color(0xa9c088), floor:new THREE.Color(0x88a478), meadow:new THREE.Color(0xc6cf98),
+    rock:new THREE.Color(0x9ba6ae), snow:new THREE.Color(0xe2e7eb), bloom:new THREE.Color(0xffb8d0), gravel:new THREE.Color(0xeedcc0),
+  };
+  const GOAL_R = 70;
+  // GROUND_LIFT: how far the vertex colours are pulled toward white, since the projected
+  // paint multiplies over them (0 = the colours as they are, which goes dark under the paint)
+  const GROUND_LIFT = .12, WHITE = new THREE.Color(0xffffff);
+  const col = new Float32Array((NX+1)*(NZ+1)*3);
+  function paintLand(lift){
+    const c = new THREE.Color();
+    for(let j=0;j<=NZ;j++) for(let i=0;i<=NX;i++){
+      const k = j*(NX+1)+i, x = X0+i*CS, z = Z0+j*CS, h = H[k];
+      terrainAt(Math.min(x, X0+NX*CS-.01), Math.min(z, Z0+NZ*CS-.01), _tn);
+      c.copy(C.grass).lerp(C.meadow, smooth(40, 110, h)).lerp(C.rock, smooth(150, 240, h)).lerp(C.snow, smooth(270, 360, h));
+      c.lerp(C.rock, smooth(.86, .6, _tn.y));                                  // steep faces are bare
+      c.lerp(C.floor, (1-smooth(0, 220, z))*smooth(130, 40, h)*.6);           // the foothill forest floor is darker
+      { const b = bankW(x, z), gk = streamOn(z)*(1 - smooth(b*.6, b*1.3, Math.abs(x - streamX(z)))); if(gk > 0){ c.lerp(C.gravel, gk*.9); c.multiplyScalar(1 + .35*gk); } }   // the stream's gravel banks
+      c.lerp(WHITE, lift);
+      // the goal: the whole top in bright blossom, right out to where the goal counts. the
+      // colour is pushed past 1 so it stays bright under the projected paint
+      const gk = smooth(GOAL_R+4, GOAL_R-6, Math.hypot(x-GOAL.x, z-GOAL.z));
+      if(gk > 0){ c.lerp(C.bloom, gk); c.multiplyScalar(1 + .8*gk); }
+      const m = .92 + .16*fbm(x*.03, z*.03, 3);                                 // watercolour mottle
+      col[k*3] = c.r*m; col[k*3+1] = c.g*m; col[k*3+2] = c.b*m;
+    }
+    if(land) land.geometry.attributes.color.needsUpdate = true;
+  }
+  let land = null;
+  land = (()=>{
+    const pos = new Float32Array((NX+1)*(NZ+1)*3), idx = [];
+    for(let j=0;j<=NZ;j++) for(let i=0;i<=NX;i++){
+      const k = j*(NX+1)+i;
+      pos[k*3] = X0+i*CS; pos[k*3+1] = H[k]; pos[k*3+2] = Z0+j*CS;
+    }
+    paintLand(GROUND_LIFT);
+    for(let j=0;j<NZ;j++) for(let i=0;i<NX;i++){
+      const a = j*(NX+1)+i, b = a+1, cI = a+NX+1, d = cI+1;
+      idx.push(a, cI, b, b, cI, d);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    g.setIndex(idx); g.computeVertexNormals();
+    // the island's hill paint and grain, projected from above like on the island, over the vertex colours
+    const mat = withShadowTri(new THREE.MeshLambertMaterial({color:0xffffff, vertexColors:true}), ISLE_TEX.hillN, .5);
+    mat.userData.tri.value = ISLE_TEX.hill;
+    const m = new THREE.Mesh(g, mat);
+    root.add(m);
+    return m;
+  })();
+
+  /* ---- clouds: a few in the valley air, and the thin ceiling layer where the climb runs out ---- */
+  const cloudMats = makeCloudMats(S.cloud, 8, false);
+  let seed = 7;
+  const rnd = ()=>{ seed = (seed*16807)%2147483647; return seed/2147483647; };
+  const clouds = scatterClouds(root, cloudMats, {n:20, rnd, gap:50,
+    at:()=>[-700+rnd()*1400, -300+rnd()*1500], yMin:70, yMax:135, wMin:30, wMax:240, vMin:.6, vMax:1.4});
+  const ceilMats = makeCloudMats(S.cloud, 8, false); for(const m of ceilMats) m.opacity = .5;
+  for(let i=0;i<70;i++){
+    const c = new THREE.Sprite(ceilMats[i%8].clone()); c.userData.op = .5;
+    c.position.set(-900+rnd()*1800, S.cap.soft+25+rnd()*(S.cap.hard-S.cap.soft), -400+rnd()*1800);
+    const w = 170+rnd()*140; c.scale.set(w, w*.26, 1);
+    c.userData.v = .3+rnd()*.4; root.add(c); clouds.push(c);
+  }
+
+  /* ---- a column of light over the goal: seen from the start, over the pass ---- */
+  const beam = (()=>{
+    const W = 64, Hh = 256, px = new Uint8Array(W*Hh*4);
+    for(let y=0;y<Hh;y++) for(let x=0;x<W;x++){
+      const u = Math.abs(x-W/2+.5)/(W/2), a = Math.max(0, 1-u)*(1 - y/Hh);
+      const o = (y*W+x)*4; px[o]=255; px[o+1]=208; px[o+2]=112; px[o+3]=255*a*a;   // gold: the only warm accent in view
+    }
+    const t = new THREE.DataTexture(px, W, Hh); t.magFilter = t.minFilter = THREE.LinearFilter; t.colorSpace = THREE.SRGBColorSpace; t.needsUpdate = true;
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(26, 320), new THREE.MeshBasicMaterial({map:t, transparent:true, opacity:.5, depthWrite:false, fog:false, blending:THREE.AdditiveBlending, side:THREE.DoubleSide}));
+    m.position.set(GOAL.x, GOAL.y + 150, GOAL.z); root.add(m); return m;
+  })();
+
+  /* ---- the stream: a ribbon of water down the channel, its streaks drifting downstream ---- */
+  const water = (()=>{
+    const N = Math.ceil((SR.z1 - SR.z0)/3), pos = [], uv = [], idx = [];
+    for(let i=0;i<=N;i++){
+      const z = SR.z0 + i*(SR.z1-SR.z0)/N, cx = streamX(z), y = streamY(z);
+      const w = streamW(z)*1.25;
+      pos.push(cx - w, y, z, cx + w, y, z); uv.push(0, z/24, 1, z/24);
+      if(i<N){ const k=i*2; idx.push(k, k+2, k+1, k+1, k+2, k+3); }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2)); g.setIndex(idx);
+    // the sea's material, shader untouched: a copy with its own uniforms. the sea's shallows map and
+    // ripple window are moved out of reach, the fog is the mountain's, the bird shadows are shared
+    const mat = seaStage.waterMat.clone();
+    const U = mat.uniforms;
+    U.uShadows = shadowU.uShadows;
+    U.uShalO.value = 1e6; U.uRipO.value.set(1e6, 1e6);
+    U.uFog.value = srgb(S.fog); U.uGlow.value = srgb(S.glow); U.uSun.value = new THREE.Vector3(...S.sun).normalize();
+    const m = new THREE.Mesh(g, mat);
+    root.add(m);
+    return m;
+  })();
+  function waterAt(x, z){
+    if(z < SR.z0 || z > SR.z1 || streamOn(z) < .5) return null;
+    return Math.abs(x - streamX(z)) < streamW(z) ? streamY(z) : null;
+  }
+
+  /* ---- cliffs: sheer slabs of the rock material standing out of the slope. the top is a ledge to land on;
+     the face knocks a bird loose like a rock at sea. ---- */
+  const cliffs = [];
+  const cliffAt = [];                    // {x, z, r} for keeping trees and bushes off them
+  const cliffMat = makeStoneMat(); cliffMat.color.setHex(0xc8c8c4);   // the mountain's stone a step deeper than the sea's
+  for(const [u, z, wdt, hgt, rot] of S.cliffs){
+    const cx = axisX(z) + u, N = 26, pos = [], idx = [];
+    let base = 1e9;
+    // a long, ragged plan about 9 m deep; the outline is broken so it reads as split rock, not a wall
+    const plan = [];
+    for(let i=0;i<N;i++){
+      const a = i/N*Math.PI*2, ca = Math.cos(a), sa = Math.sin(a), j = hsh(i*7+u|0, z|0);
+      const lx = Math.sign(ca)*Math.pow(Math.abs(ca), .4)*wdt/2*(.9 + .2*j), lz = Math.sign(sa)*Math.pow(Math.abs(sa), .4)*4.5*(.7 + .6*hsh(i, z|0));
+      plan.push([lx, lz]);
+    }
+    const put = (lx, lz)=>[cx + lx*Math.cos(rot) + lz*Math.sin(rot), z - lx*Math.sin(rot) + lz*Math.cos(rot)];
+    for(const [lx, lz] of plan){ const [x, zz] = put(lx, lz); base = Math.min(base, terrainAt(x, zz)); }
+    const top = terrainAt(cx, z) + hgt;
+    // rings from the top down: the face leans in a little toward the top and steps out at two bands
+    const rings = [[1, 0], [.97, .05], [.97, .42], [1.05, .45], [1.03, .74], [1.1, .77], [1.12, 1]];
+    pos.push(cx, top + .3, z);
+    rings.forEach(([sc, f], r)=>{
+      for(let i=0;i<N;i++){
+        const [lx, lz] = plan[i], wob = r ? 1 + (hsh(i+r*31, z|0)-.5)*.08 : 1;
+        const [x, zz] = put(lx*sc*wob, lz*sc*wob);
+        pos.push(x, f < 1 ? top - f*(top - base) + (r === 0 ? (hsh(i, 3)-.5)*1.2 : (hsh(i, r)-.5)*1.5) : base - 4, zz);
+      }
+    });
+    for(let i=0;i<N;i++) idx.push(0, 1+(i+1)%N, 1+i);
+    for(let r=0;r<rings.length-1;r++) for(let i=0;i<N;i++){
+      const a = 1+r*N+i, b = 1+r*N+(i+1)%N, c = 1+(r+1)*N+i, d = 1+(r+1)*N+(i+1)%N;
+      idx.push(a, b, c, b, d, c);
+    }
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setIndex(idx); g.computeVertexNormals();
+    const m = new THREE.Mesh(g, cliffMat); root.add(m);
+    g.computeBoundingSphere();
+    m.userData.cx = g.boundingSphere.center.x; m.userData.cz = g.boundingSphere.center.z; m.userData.rad = g.boundingSphere.radius + .5;
+    cliffs.push(m); cliffAt.push({x:cx, z, r:wdt/2 + 6});
+  }
+  // trees, bushes and rocks stay off the stream and the cliffs
+  const keepClear = (x, z, pad=0)=>(streamOn(z) > .3 && Math.abs(x - streamX(z)) < bankW(x, z) + pad) || cliffAt.some(c=>Math.hypot(x-c.x, z-c.z) < c.r + pad);
+
+  /* ---- rising air: fixed columns, shown as wisps drifting upward. a bird in one climbs and
+     glides faster, and the ceiling lifts for it. nothing turns the bird. ---- */
+  const thermals = S.thermals.map(([u,z,r])=>({x:axisX(z)+u, z, r, y:terrainAt(axisX(z)+u, z)}));
+  const WISP_H = 130;
+  /* how rising air shows: a faint column of light, long streaks running up it, and leaves carried
+     up in a loose spiral. all of it moves upward, so the direction reads at a glance */
+  const streakTex = (()=>{                      // a thin vertical streak, soft at both ends and sides
+    const W = 16, Hh = 128, px = new Uint8Array(W*Hh*4);
+    for(let y=0;y<Hh;y++) for(let x=0;x<W;x++){
+      const u = Math.abs(x-W/2+.5)/(W/2), v = y/Hh, a = Math.max(0, 1-u*u)*Math.sin(v*Math.PI)**1.5;
+      const o = (y*W+x)*4; px[o]=255; px[o+1]=252; px[o+2]=240; px[o+3]=255*a;
+    }
+    const t = new THREE.DataTexture(px, W, Hh); t.magFilter = t.minFilter = THREE.LinearFilter; t.colorSpace = THREE.SRGBColorSpace; t.needsUpdate = true; return t;
+  })();
+  const columnTex = (()=>{                      // the column: brightest low down, gone by the top, with faint vertical bands
+    const W = 64, Hh = 128, px = new Uint8Array(W*Hh*4);
+    for(let y=0;y<Hh;y++) for(let x=0;x<W;x++){
+      const v = y/Hh, band = .6 + .4*Math.sin(x/W*Math.PI*2*6 + Math.sin(v*9)*.8);
+      const a = (1 - v)**1.6 * Math.min(1, v*8) * band;
+      const o = (y*W+x)*4; px[o]=255; px[o+1]=250; px[o+2]=236; px[o+3]=255*a;
+    }
+    const t = new THREE.DataTexture(px, W, Hh); t.wrapS = THREE.RepeatWrapping; t.magFilter = t.minFilter = THREE.LinearFilter; t.colorSpace = THREE.SRGBColorSpace; t.needsUpdate = true; return t;
+  })();
+  const leafGeo = (()=>{ const g = new THREE.BufferGeometry();       // a small pointed leaf, two-sided
+    g.setAttribute('position', new THREE.Float32BufferAttribute([0,-.35,0, .16,0,0, 0,.35,0, -.16,0,0], 3)); g.setIndex([0,1,2, 0,2,3]); g.computeVertexNormals(); return g; })();
+  const STREAK_N = 80, LEAF_N = 45;
+  const streakMat = new THREE.MeshBasicMaterial({map:streakTex, transparent:true, depthWrite:false, blending:THREE.AdditiveBlending, opacity:.55, side:THREE.DoubleSide});
+  const leafMat = new THREE.MeshBasicMaterial({color:0xffffff, side:THREE.DoubleSide});
+  const wisps = thermals.map((t, ti)=>{
+    const col = new THREE.Mesh(new THREE.CylinderGeometry(t.r*.8, t.r*.95, WISP_H, 24, 1, true),
+      new THREE.MeshBasicMaterial({map:columnTex.clone(), transparent:true, depthWrite:false, blending:THREE.AdditiveBlending, opacity:.4, side:THREE.DoubleSide}));
+    col.material.map.needsUpdate = true; col.material.map.repeat.set(2, 1);
+    col.position.set(t.x, t.y + WISP_H/2, t.z); root.add(col);
+    const st = new THREE.InstancedMesh(new THREE.PlaneGeometry(.45, 11), streakMat, STREAK_N);
+    const lf = new THREE.InstancedMesh(leafGeo, leafMat, LEAF_N);
+    st.frustumCulled = lf.frustumCulled = false;
+    const c = new THREE.Color();
+    for(let i=0;i<LEAF_N;i++){ c.setHex([0xb7c27a, 0xd8c26a, 0xc79a5a, 0x9fb878][i%4]).offsetHSL(0, 0, (hsh(i, ti)-.5)*.1); lf.setColorAt(i, c); }
+    lf.instanceColor.needsUpdate = true;
+    root.add(st, lf);
+    const ph = Array.from({length:STREAK_N}, (_, i)=>i/STREAK_N), lph = Array.from({length:LEAF_N}, (_, i)=>i/LEAF_N);
+    return {t, col, st, lf, ph, lph};
+  });
+  const _wm = new THREE.Matrix4(), _wq = new THREE.Quaternion(), _wp = new THREE.Vector3(), _ws = new THREE.Vector3(), _we = new THREE.Euler();
+  function thermalAt(p){
+    let k = 0;
+    for(const t of thermals){
+      const r = Math.hypot(p.x-t.x, p.z-t.z)/t.r;
+      if(r >= 1 || p.y > t.y + WISP_H + 10) continue;
+      k = Math.max(k, 1 - r*r*r*r);                   // full strength over most of the column, soft only at the rim
+    }
+    return k;
+  }
+  function wispTick(dt, cam){
+    const now = clock.elapsedTime;
+    for(const w of wisps){
+      const {t} = w;
+      w.col.material.map.offset.y -= dt*.12;                    // the column's bands creep upward
+      const yaw = Math.atan2(cam.position.x - t.x, cam.position.z - t.z);   // streaks turn to face the camera
+      for(let i=0;i<STREAK_N;i++){
+        w.ph[i] += dt*(.1 + .05*hsh(i, 21)); if(w.ph[i] > 1) w.ph[i] -= 1;
+        const a = i*2.4 + w.ph[i]*1.2, r = t.r*(.15 + .65*hsh(i, 11)), f = w.ph[i];
+        _wp.set(t.x + Math.cos(a)*r, t.y + 4 + f*WISP_H, t.z + Math.sin(a)*r);
+        const k = Math.sin(f*Math.PI);                          // fade in at the bottom, out at the top
+        _wq.setFromAxisAngle(_Y, yaw); _ws.set(1, .6 + .8*k, 1);
+        _wm.compose(_wp, _wq, _ws); w.st.setMatrixAt(i, _wm);
+      }
+      w.st.instanceMatrix.needsUpdate = true;
+      for(let i=0;i<LEAF_N;i++){
+        w.lph[i] += dt*(.06 + .03*hsh(i, 31)); if(w.lph[i] > 1) w.lph[i] -= 1;
+        const f = w.lph[i], a = i*1.7 + f*9, r = t.r*(.2 + .45*hsh(i, 41))*(1 - .3*f);
+        _wp.set(t.x + Math.cos(a)*r, t.y + 1 + f*WISP_H*.7, t.z + Math.sin(a)*r);
+        _we.set(now*(2 + hsh(i,51)*3) + i, now*(1.5 + hsh(i,61)*2), now*(2.5 + hsh(i,71)*2)); _wq.setFromEuler(_we);
+        _ws.setScalar(1.6 + 1.2*hsh(i, 81));               // big enough to read from a distance
+        _wm.compose(_wp, _wq, _ws); w.lf.setMatrixAt(i, _wm);
+      }
+      w.lf.instanceMatrix.needsUpdate = true;
+    }
+  }
+  /* ---- the valley mist:  /* ---- the valley mist: lies in the middle of the valley, comes and goes, and thins near the
+     ground. the scene fog is drawn in while the bird is inside it. ---- */
+  const F = S.mist;
+  const mistMats = makeCloudMats(0xf2f3ee);
+  const mists = [];
+  seed = 77;
+  for(let i=0;i<34;i++){
+    const z = F.z0 + rnd()*(F.z1-F.z0), x = axisX(z) + (rnd()-.5)*F.halfW*1.6;
+    const c = new THREE.Sprite(mistMats[i%4].clone());
+    const w = 70+rnd()*60; c.scale.set(w, w*.4, 1);
+    c.userData.v = .2+rnd()*.3; c.userData.lift = rnd()*22;
+    c.position.set(x, mistY(c), z);
+    root.add(c); mists.push(c);
+  }
+  // a mist card floats clear of the ground under its whole width, so it never cuts into a slope
+  // (the cut is what drew the hard line). it follows the ground as it drifts
+  function mistY(c){
+    const hw = c.scale.x*.5; let g = -1e9;
+    for(let k=0;k<9;k++){ const a = k/8*Math.PI*2, r = k ? hw : 0; g = Math.max(g, terrainAt(c.position.x + Math.cos(a)*r, c.position.z + Math.sin(a)*r)); }
+    return g + c.scale.y*.5 + 3 + c.userData.lift;
+  }
+  function mistAt(p, now){
+    const inZ = smooth(F.z0-40, F.z0+40, p.z) * (1 - smooth(F.z1-40, F.z1+40, p.z));
+    const inX = 1 - smooth(F.halfW*.6, F.halfW*1.2, Math.abs(p.x - axisX(p.z)));
+    const cycle = .35 + .65*(.5 + .5*Math.sin(now*Math.PI*2/F.period));
+    const zone = inZ*inX*cycle;
+    return {zone, k:zone*(.3 + .7*smooth(F.low-4, F.low+6, p.y - terrainAt(p.x, p.z)))};
+  }
+  let fogK = 0;
+
+  /* ---- trees: one model, many instances. placement waits for the model. ---- */
+  /* the tree's shape for collisions, in the model's own space at scale 1. measured from the model
+     (treeShapeFrom), so a replaced tree brings its own; S.treeShape can override it by hand.
+       spheres: the crown as a cluster of balls (one per leaf clump)
+       rootY:   the bottom of the trunk (the model's origin need not be at the root)
+       trunkR:  the trunk's radius near the ground */
+  let shape = S.treeShape || {spheres:[[0,14,0,7]], rootY:0, trunkR:.5};
+  let tTop = 21, tR = 6.5, tBase = 5;    // derived from the shape: crown top, reach, underside (used by bushes and tufts too)
+  function deriveShape(){
+    tTop = -1e9; tBase = 1e9; tR = 0;
+    for(const [x,y,z,r] of shape.spheres){ tTop = Math.max(tTop, y+r); tBase = Math.min(tBase, y-r); tR = Math.max(tR, Math.hypot(x,z)+r); }
+  }
+  deriveShape();
+  function treeShapeFrom(src){
+    const o = src.clone(true); o.updateMatrixWorld(true);
+    const leafPts = [], woodPts = [];
+    const v = new THREE.Vector3();
+    o.traverse(c=>{
+      if(!c.isMesh) return;
+      const nm = (c.material && c.material.name || '') + ' ' + c.name, P = c.geometry.attributes.position, pts = [];
+      for(let i=0;i<P.count;i++){ v.fromBufferAttribute(P, i).applyMatrix4(c.matrixWorld); pts.push(v.toArray()); }
+      (/leaf|leaves|ha_|foliage/i.test(nm) ? leafPts : woodPts).push(pts);
+    });
+    const ball = pts=>{
+      const c = [0,0,0]; for(const p of pts){ c[0]+=p[0]; c[1]+=p[1]; c[2]+=p[2]; } c[0]/=pts.length; c[1]/=pts.length; c[2]/=pts.length;
+      const d = pts.map(p=>Math.hypot(p[0]-c[0], p[1]-c[1], p[2]-c[2])).sort((a,b)=>a-b);
+      return [c[0], c[1], c[2], d[Math.floor(d.length*.85)] || .5];      // most of the clump, not its stray tips
+    };
+    let spheres;
+    if(leafPts.length >= 3) spheres = leafPts.map(ball);                  // one ball per leaf clump
+    else {                                                                // one big leaf mesh: split it on a coarse grid
+      const all = leafPts.flat(); if(!all.length) return null;
+      const bb = new THREE.Box3(); for(const p of all) bb.expandByPoint(v.fromArray(p));
+      const sz = bb.getSize(new THREE.Vector3()), n = 3, cells = new Map();
+      for(const p of all){
+        const k = [0,1,2].map(a=>Math.min(n-1, Math.floor((p[a]-bb.min.getComponent(a))/Math.max(1e-3, sz.getComponent(a))*n))).join(',');
+        (cells.get(k) || cells.set(k, []).get(k)).push(p);
+      }
+      spheres = [...cells.values()].filter(c=>c.length > 6).map(ball);
+    }
+    const wood = woodPts.flat();
+    let rootY = 0, trunkR = .5;
+    if(wood.length){
+      rootY = Math.min(...wood.map(p=>p[1]));
+      // the trunk's girth: measured part way up the bare trunk, above the root flare and below the branches
+      // 1 m bands of the bark's points between the root flare and the crown; the slimmest band's median radius
+      const under = Math.min(...spheres.map(b=>b[1]-b[3])), lo = rootY + Math.max(1.5, (under - rootY)*.35);
+      const bands = new Map();
+      for(const p of wood) if(p[1] > lo && p[1] < under){ const k = Math.floor(p[1]); (bands.get(k) || bands.set(k, []).get(k)).push(Math.hypot(p[0], p[2])); }
+      const med = [...bands.values()].filter(b=>b.length >= 4).map(b=>b.sort((x,y)=>x-y)[Math.floor(b.length/2)]);
+      trunkR = med.length ? Math.min(...med) : .5;
+    }
+    return {spheres, rootY, trunkR};
+  }
+  // a placed tree: its balls and trunk in the world (yaw a, scale s)
+  function fitTree(t){
+    const c = Math.cos(t.a), sn = Math.sin(t.a);
+    t.sph = shape.spheres.map(([x,y,z,r])=>[t.x + (x*c + z*sn)*t.s, t.y + y*t.s, t.z + (-x*sn + z*c)*t.s, r*t.s]);
+    t.reach = tR*t.s;
+    t.y0 = t.y + shape.rootY*t.s;                                          // root
+    t.y1 = Math.min(...t.sph.map(b=>b[1]-b[3]*.5));                        // the trunk runs up into the crown
+    t.tr = shape.trunkR*t.s;
+  }
+  // set a tree on the ground: the trunk's foot sits on the lowest ground round it, so on a slope the
+  // downhill side still touches; the uphill side sinks into the slope
+  function seat(t){
+    const r = Math.max(.3, shape.trunkR*t.s);
+    let g = terrainAt(t.x, t.z);
+    for(let k=0;k<6;k++){ const a = k/6*Math.PI*2; g = Math.min(g, terrainAt(t.x + Math.cos(a)*r, t.z + Math.sin(a)*r)); }
+    t.y = g - .15*t.s - shape.rootY*t.s;
+    fitTree(t);
+  }
+  const trees = [];                      // {x, y, z, s, a, sph, reach, y0, y1, tr}
+  const treeGrid = new Map();            // 40 m cells -> tree indices
+  const TG = 40;
+  const tKey = (x,z)=>Math.floor(x/TG)+','+Math.floor(z/TG);
+  let treeMeshes = [];
+  const START = new THREE.Vector3(S.start[0], 0, S.start[2]);
+  const rockAt = [];                     // {x, z, r}: placed rocks, kept clear of trees
+  function planTrees(){
+    trees.length = 0; treeGrid.clear();
+    seed = 29;
+    for(let z=-260; z<1240; z+=18) for(let x=-520; x<520; x+=18){
+      const px = x + (rnd()-.5)*14, pz = z + (rnd()-.5)*14;
+      const h = terrainAt(px, pz, _tn);
+      if(h > 125 || _tn.y < .58) continue;                                 // tree line, and no trees on faces
+      if(Math.hypot(px-START.x, pz-START.z) < 16) continue;                // the start clearing
+      const dg = Math.hypot(px-GOAL.x, pz-GOAL.z);
+      if(dg < 34) continue;                                                // the ring under the great tree
+      if(spots.some(sp=>Math.hypot(px-sp.x, pz-sp.z) < 10)) continue;        // the lone birds sit in the open
+      if(keepClear(px, pz, 2)) continue;
+      const au = Math.abs(px - axisX(pz));
+      const n = fbm(px*.009+5, pz*.009+2);
+      // the foothill forest is dense, the meadow slope open, the far side scattered
+      let keep = pz < 230 ? (au < 280 ? .6 : .72) : pz < 500 ? .8 - .18*smooth(40, 160, au) : pz < 720 ? .66 : .65;
+      if(dg < 120) keep = .64;
+      const sc = .38 + rnd()*.34;
+      if(n < keep) continue;
+      if(rockAt.some(r=>Math.hypot(px-r.x, pz-r.z) < r.r + tR*sc*.8)) continue;   // no tree growing through a rock
+      const t = {x:px, z:pz, s:sc, a:(trees.length*2.399) % (Math.PI*2)};
+      seat(t); trees.push(t);
+    }
+    // the great tree on the goal hill
+    const g = {x:GOAL.x, z:GOAL.z, s:1.05, a:(trees.length*2.399) % (Math.PI*2), big:true};
+    seat(g); trees.push(g);
+    trees.forEach((t,i)=>{ const k = tKey(t.x,t.z); (treeGrid.get(k) || treeGrid.set(k, []).get(k)).push(i); });
+  }
+  planTrees();
+  // every tree whose reach covers (x,z)
+  function treesNear(x, z, fn){
+    const cx = Math.floor(x/TG), cz = Math.floor(z/TG);
+    for(let j=cz-1;j<=cz+1;j++) for(let i=cx-1;i<=cx+1;i++){
+      const cell = treeGrid.get(i+','+j); if(!cell) continue;
+      for(const n of cell){ const t = trees[n]; if(Math.abs(x-t.x) < t.reach && Math.abs(z-t.z) < t.reach) fn(t); }
+    }
+  }
+  // the crown's upper surface over (x,z): where a bird stands on the tree. sets treeN to the leaves' slope there
+  const treeN = new THREE.Vector3(0,1,0);
+  function treeTopAt(x, z){
+    let best = null;
+    treesNear(x, z, t=>{
+      for(const [cx,cy,cz,r] of t.sph){
+        const d2 = (x-cx)*(x-cx) + (z-cz)*(z-cz); if(d2 >= r*r) continue;
+        const y = cy + Math.sqrt(r*r - d2);
+        if(best === null || y > best){ best = y; treeN.set(x-cx, y-cy, z-cz).multiplyScalar(1/r); }
+      }
+    });
+    return best;
+  }
+  // the trunk: a column the bird is pushed out of (it never knocks a bird loose). out gets the push
+  function trunkPush(p, rad, out){
+    let hit = false;
+    treesNear(p.x, p.z, t=>{
+      if(p.y < t.y0 || p.y > t.y1) return;
+      const dx = p.x - t.x, dz = p.z - t.z, d = Math.hypot(dx, dz), m = t.tr + rad;
+      if(d >= m) return;
+      const k = d > 1e-4 ? (m - d)/d : 0;
+      if(!hit) out.set(0,0,0);
+      out.x += d > 1e-4 ? dx*k : m; out.z += d > 1e-4 ? dz*k : 0; hit = true;
+    });
+    return hit;
+  }
+  function withShadowInst(mat){
+    mat.onBeforeCompile = sh=>{
+      Object.assign(sh.uniforms, shadowU);
+      sh.vertexShader = 'varying vec3 vShPos;\n' + sh.vertexShader.replace('#include <project_vertex>',
+        '#include <project_vertex>\n  vShPos = (modelMatrix*instanceMatrix*vec4(transformed,1.0)).xyz;');
+      sh.fragmentShader = 'varying vec3 vShPos;\n' + SHADOW_GLSL + '\n' + sh.fragmentShader.replace('#include <map_fragment>',
+        `#include <map_fragment>\n  diffuseColor.rgb *= mix(vec3(1.), ${SHADE_LIN}, birdShade(vShPos));`);
+    };
+    mat.customProgramCacheKey = ()=>'shadowed-inst';
+    return mat;
+  }
+  const treeMats = {trunk:withShadowInst(new THREE.MeshLambertMaterial({color:0xffffff})),
+                    leaf:withShadowInst(new THREE.MeshLambertMaterial({color:0xffffff, side:THREE.DoubleSide}))};
+  // bake the model's parts into two geometries (wood, leaves) in the model's own space
+  function bakeTree(src){
+    const o = src.clone(true); o.updateMatrixWorld(true);
+    const wood = [], leaf = [];
+    o.traverse(c=>{
+      if(!c.isMesh) return;
+      const nm = (c.material && c.material.name || '') + ' ' + c.name;
+      let g = c.geometry.clone();
+      for(const k of Object.keys(g.attributes)) if(k !== 'position' && k !== 'normal') g.deleteAttribute(k);
+      if(!g.attributes.normal) g.computeVertexNormals();
+      g.applyMatrix4(c.matrixWorld);
+      if(g.index) g = g.toNonIndexed();
+      (/leaf|leaves|ha_|foliage/i.test(nm) ? leaf : wood).push(g);
+    });
+    const bb = new THREE.Box3().setFromObject(o);
+    return {wood:wood.length ? mergeGeometries(wood) : null, leaf:leaf.length ? mergeGeometries(leaf) : null, bb};
+  }
+  function buildTrees(parts){
+    for(const m of treeMeshes){ root.remove(m); m.dispose(); }
+    treeMeshes = [];
+    const M = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new THREE.Vector3(), sc = new THREE.Vector3(), col = new THREE.Color();
+    const Y = new THREE.Vector3(0,1,0);
+    for(const [key, geo] of [['trunk', parts.wood], ['leaf', parts.leaf]]){
+      if(!geo) continue;
+      const im = new THREE.InstancedMesh(geo, treeMats[key], trees.length);
+      trees.forEach((t,i)=>{
+        q.setFromAxisAngle(Y, t.a);
+        p.set(t.x, t.y, t.z); sc.setScalar(t.s);
+        M.compose(p, q, sc); im.setMatrixAt(i, M);
+        const v = hsh(i, 3);
+        if(key === 'leaf') col.setHex(t.big ? 0xf2b9c8 : 0x67875f).offsetHSL(t.big ? 0 : (v-.5)*.06, 0, t.big ? 0 : (hsh(i,5)-.5)*.1);   // the great tree is in bloom
+        else col.setHex(0x9a8068).offsetHSL(0, 0, (v-.5)*.08);
+        im.setColorAt(i, col);
+      });
+      im.instanceMatrix.needsUpdate = true; im.instanceColor.needsUpdate = true;
+      im.frustumCulled = false;
+      root.add(im); treeMeshes.push(im);
+    }
+    return parts.leaf;
+  }
+
+  /* ---- bushes: the tree's leaves alone, small, on the open ground of the second half. a bird under one is hidden. ---- */
+  const bushes = [];                     // {x, y, z, s}
+  const bushGrid = new Map();
+  let bushMesh = null;
+  function planBushes(){
+    bushes.length = 0; bushGrid.clear();
+    seed = 53;
+    for(let z=-200; z<1150; z+=12) for(let x=-420; x<420; x+=12){
+      const px = x + (rnd()-.5)*10, pz = z + (rnd()-.5)*10;
+      const h = terrainAt(px, pz, _tn);
+      if(h > 135 || _tn.y < .6) continue;
+      if(Math.hypot(px-START.x, pz-START.z) < 14 || Math.hypot(px-GOAL.x, pz-GOAL.z) < GOAL_R + 6) continue;
+      if(spots.some(sp=>Math.hypot(px-sp.x, pz-sp.z) < 8)) continue;
+      if(treeTopAt(px, pz) !== null || keepClear(px, pz)) continue;
+      const n = fbm(px*.013+9, pz*.013-4);
+      const keep = pz < 300 ? .78 : .66;                  // sparse in the forest, more on the open slopes
+      if(n < keep) continue;
+      const sc = .2 + rnd()*.1;
+      bushes.push({x:px, y:h - tBase*sc + .1, z:pz, s:sc});
+    }
+    bushes.forEach((b,i)=>{ const k = tKey(b.x,b.z); (bushGrid.get(k) || bushGrid.set(k, []).get(k)).push(i); });
+  }
+  function buildBushes(leafGeo){
+    if(bushMesh){ root.remove(bushMesh); bushMesh.dispose(); bushMesh = null; }
+    if(!leafGeo || !bushes.length) return;
+    const M = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new THREE.Vector3(), sc = new THREE.Vector3(), col = new THREE.Color(), Y = new THREE.Vector3(0,1,0);
+    bushMesh = new THREE.InstancedMesh(leafGeo, treeMats.leaf, bushes.length);
+    bushes.forEach((b,i)=>{
+      q.setFromAxisAngle(Y, (i*1.7) % (Math.PI*2)); p.set(b.x, b.y, b.z); sc.set(b.s*1.3, b.s, b.s*1.3);
+      M.compose(p, q, sc); bushMesh.setMatrixAt(i, M);
+      col.setHex(0x86a272).offsetHSL((hsh(i,7)-.5)*.05, 0, (hsh(i,9)-.5)*.1); bushMesh.setColorAt(i, col);
+    });
+    bushMesh.instanceMatrix.needsUpdate = true; bushMesh.instanceColor.needsUpdate = true; bushMesh.frustumCulled = false;
+    root.add(bushMesh);
+  }
+  // is a bird at p under cover: beneath a tree's leaves, or in a bush
+  function hiddenAt(p){
+    const cx = Math.floor(p.x/TG), cz = Math.floor(p.z/TG);
+    for(let j=cz-1;j<=cz+1;j++) for(let i=cx-1;i<=cx+1;i++){
+      const k = i+','+j;
+      const tc = treeGrid.get(k);
+      if(tc) for(const n of tc){ const t = trees[n]; for(const [cx,cy,cz,r] of t.sph) if(Math.hypot(p.x-cx, p.z-cz) < r*.9 && p.y < cy && p.y > t.y0 - 1) return true; }   // beneath the leaves
+      const bc = bushGrid.get(k);
+      if(bc) for(const n of bc){ const b = bushes[n]; if(Math.hypot(p.x-b.x, p.z-b.z) < tR*b.s*1.2 && p.y < b.y + tTop*b.s + .6) return true; }
+    }
+    return false;
+  }
+
+  /* ---- boulders: the author's rocks on the slopes. a rock face is the one thing that knocks a bird loose. ---- */
+  const stoneMat = makeStoneMat(); stoneMat.color.setHex(0xc8c8c4);
+  const rocks = [];                      // meshes, with bounding circles for the ray test
+  const ray = new THREE.Raycaster(), rayO = new THREE.Vector3(), DOWN = new THREE.Vector3(0,-1,0);
+  const _bs = new THREE.Sphere(), _gn = new THREE.Vector3();
+  function placeRocks(lib){
+    for(const r of rocks){ r.parent && r.parent.remove(r); }
+    rocks.length = 0; rockAt.length = 0;
+    const all = [...lib.l, ...lib.m, ...lib.s]; if(!all.length) return;
+    seed = 101;
+    let n = 0;
+    for(let k=0;k<400 && n<34;k++){
+      const z = -150 + rnd()*1250, x = axisX(z) + (rnd()<.5?-1:1)*(28 + rnd()*120);
+      const h = terrainAt(x, z, _tn);
+      if(h > 170 || _tn.y < .7) continue;
+      if(Math.hypot(x-START.x, z-START.z) < 30 || Math.hypot(x-GOAL.x, z-GOAL.z) < 60) continue;
+      if(spots.some(sp=>Math.hypot(x-sp.x, z-sp.z) < 18) || keepClear(x, z, 6)) continue;
+      if(rocks.some(r=>Math.hypot(r.position.x-x, r.position.z-z) < 40)) continue;
+      const src = all[Math.floor(rnd()*all.length)];
+      const o = src.clone(true);
+      o.traverse(c=>{ if(c.isMesh) c.material = stoneMat; });
+      o.position.set(x, h-.4, z); o.rotation.y = rnd()*6.28; o.scale.setScalar(.8 + rnd()*.6);
+      root.add(o); o.updateMatrixWorld(true);
+      { const bs = new THREE.Box3().setFromObject(o); rockAt.push({x, z, r:Math.max(bs.max.x-bs.min.x, bs.max.z-bs.min.z)*.5 + 1}); }
+      o.traverse(c=>{
+        if(!c.isMesh) return;
+        if(!c.geometry.boundingSphere) c.geometry.computeBoundingSphere();
+        _bs.copy(c.geometry.boundingSphere).applyMatrix4(c.matrixWorld);
+        c.userData.cx = _bs.center.x; c.userData.cz = _bs.center.z; c.userData.rad = _bs.radius + .5;
+        rocks.push(c);
+      });
+      n++;
+    }
+  }
+  let rescue = null;
+  function pickRestTree(){
+    let best = null, bd = 1e9;
+    for(const t of trees){
+      if(t.big || spots.some(sp=>Math.hypot(t.x-sp.x, t.z-sp.z) < 60)) continue;
+      const d = Math.hypot(t.x-axisX(280), t.z-280);
+      if(d < bd){ bd = d; best = t; }
+    }
+    rescue = best ? {x:best.x, y:(treeTopAt(best.x, best.z) ?? best.y) + .02, z:best.z} : {x:start.x, y:start.y+.02, z:start.z};
+  }
+  let bankMeshes = [];
+  function dressBanks(lib){
+    for(const m of bankMeshes){ root.remove(m); m.dispose(); }
+    bankMeshes = [];
+    seed = 211;
+    const M = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new THREE.Vector3(), sc = new THREE.Vector3(), E = new THREE.Euler(), col = new THREE.Color();
+    // stones: the author's small rocks, shrunk; one instanced mesh per rock model
+    const srcs = (lib.s.length ? lib.s : lib.m).map(o=>{ let g = null; o.traverse(c=>{ if(c.isMesh && !g) g = c.geometry; }); return g; }).filter(Boolean);
+    const stones = srcs.map(()=>[]), tufts = [];
+    for(let z=SR.z0+20; z<SR.z1-10; z+=2.2){
+      if(streamOn(z) < .6) continue;
+      const cx = streamX(z), w = streamW(z);
+      for(const side of [-1, 1]){
+        const b = bankW(cx + side*w*2, z);
+        for(let k=0;k<2;k++) if(rnd() < .8){              // stones along the water line, some standing in the water, now and then a big one
+          const o = w*(.75 + rnd()*.6) + (rnd() < .2 ? rnd()*b*.5 : 0), x = cx + side*o;
+          stones[Math.floor(rnd()*stones.length)].push({x, z:z + (rnd()-.5)*2, s:.07 + rnd()*rnd()*.25, r:rnd()*6.28});
+        }
+        for(let k=0;k<3;k++) if(rnd() < .7){              // grass where the gravel ends: the edge goes soft
+          const o = b*(.6 + rnd()*.7), x = cx + side*o;
+          tufts.push({x, z:z + (rnd()-.5)*2.2, s:.025 + rnd()*.03, r:rnd()*6.28});
+        }
+      }
+    }
+    stones.forEach((list, i)=>{
+      if(!list.length) return;
+      const im = new THREE.InstancedMesh(srcs[i], cliffMat, list.length);
+      list.forEach((st, k)=>{
+        const wy = waterAt(st.x, st.z), y = Math.max(terrainAt(st.x, st.z), wy !== null ? wy - .35 : -1e9) - .15;   // in the water they break the surface
+        E.set((rnd()-.5)*.4, st.r, (rnd()-.5)*.4); q.setFromEuler(E);
+        p.set(st.x, y, st.z); sc.set(st.s, st.s*.7, st.s);
+        M.compose(p, q, sc); im.setMatrixAt(k, M);
+      });
+      im.instanceMatrix.needsUpdate = true; im.frustumCulled = false;
+      root.add(im); bankMeshes.push(im);
+    });
+    if(bushLeaf && tufts.length){
+      const im = new THREE.InstancedMesh(bushLeaf, treeMats.leaf, tufts.length);
+      tufts.forEach((t, k)=>{
+        q.setFromAxisAngle(_Y, t.r); p.set(t.x, terrainAt(t.x, t.z) - tBase*t.s*1.05, t.z); sc.set(t.s, t.s*1.15, t.s);
+        M.compose(p, q, sc); im.setMatrixAt(k, M);
+        col.setHex(0xa9bf86).offsetHSL((hsh(k,13)-.5)*.06, 0, (hsh(k,17)-.5)*.12); im.setColorAt(k, col);
+      });
+      im.instanceMatrix.needsUpdate = true; im.instanceColor.needsUpdate = true; im.frustumCulled = false;
+      root.add(im); bankMeshes.push(im);
+    }
+  }
+  const _Y = new THREE.Vector3(0,1,0);
+  let bushLeaf = null;
+  function useProps(lib){
+    placeRocks(lib);                       // rocks first: the trees keep clear of them
+    if(lib.tree && lib.tree.length){
+      const src = lib.tree[lib.tree.length-1];
+      const sh = S.treeShape || treeShapeFrom(src); if(sh){ shape = sh; deriveShape(); }
+      planTrees(); const leaf = buildTrees(bakeTree(src)); bushLeaf = leaf; planBushes(); buildBushes(leaf);
+    }
+    dressBanks(lib);
+    for(const r of roosts) r.y = null;
+    pickRestTree();
+  }
+
+  /* ---- ground under (x,z): a treetop within reach, else a rock, else the land ---- */
+  let lastNY = 1, lastWall = false, lastWater = false;
+  const groundN = new THREE.Vector3(0,1,0);
+  function groundAt(x, z, fromY){
+    const ty = treeTopAt(x, z);
+    if(ty !== null && (fromY === undefined || ty <= fromY + 1.2)){ groundN.copy(treeN); lastNY = treeN.y < .35 ? treeN.y : 1; lastWall = false; lastWater = false; return ty; }
+    lastWater = false;
+    const near = rocks.filter(m=>Math.hypot(x-m.userData.cx, z-m.userData.cz) < m.userData.rad);
+    for(const m of cliffs) if(Math.hypot(x-m.userData.cx, z-m.userData.cz) < m.userData.rad) near.push(m);
+    if(near.length){
+      rayO.set(x, 600, z); ray.set(rayO, DOWN);
+      const hit = ray.intersectObjects(near, false)[0];
+      if(hit){
+        if(hit.face){ _gn.copy(hit.face.normal).transformDirection(hit.object.matrixWorld); lastNY = Math.abs(_gn.y); groundN.copy(_gn); } else { lastNY = 1; groundN.set(0,1,0); }
+        lastWall = true; return hit.point.y;
+      }
+    }
+    const h = terrainAt(x, z, groundN);
+    lastNY = groundN.y; lastWall = false;
+    const wy = waterAt(x, z);
+    if(wy !== null && wy > h){ lastWater = true; lastNY = 1; groundN.set(0,1,0); return wy; }   // the stream's surface: not ground to stand on
+    return h;
+  }
+  // how far out along focus -> cam the camera can sit before it is inside a tree's crown (0..1)
+  const _cv = new THREE.Vector3();
+  function inCrown(p){
+    const cx = Math.floor(p.x/TG), cz = Math.floor(p.z/TG);
+    for(let j=cz-1;j<=cz+1;j++) for(let i=cx-1;i<=cx+1;i++){
+      const tc = treeGrid.get(i+','+j); if(!tc) continue;
+      for(const n of tc){ const t = trees[n];
+        // inside one of the crown's balls
+        for(const [cx,cy,cz,r] of t.sph) if((p.x-cx)*(p.x-cx) + (p.y-cy)*(p.y-cy) + (p.z-cz)*(p.z-cz) < r*r*.9) return true; }
+    }
+    return false;
+  }
+  function camRoom(focus, cam){
+    const n = 12;
+    for(let i=1;i<=n;i++){ _cv.lerpVectors(focus, cam, i/n); if(inCrown(_cv)) return Math.max(.3, (i-1)/n); }
+    return 1;
+  }
+  // the underside of the crowns over (x,z), or null in the open
+  function crownBase(x, z){
+    let lo = null;
+    const cx = Math.floor(x/TG), cz = Math.floor(z/TG);
+    for(let j=cz-1;j<=cz+1;j++) for(let i=cx-1;i<=cx+1;i++){
+      const tc = treeGrid.get(i+','+j); if(!tc) continue;
+      for(const n of tc){ const t = trees[n];
+        for(const [cx,cy,cz,r] of t.sph){ const d2 = (x-cx)*(x-cx) + (z-cz)*(z-cz); if(d2 >= r*r*1.1) continue;
+          const b = cy - Math.sqrt(Math.max(0, r*r - d2)) - 1; if(lo === null || b < lo) lo = b; } }
+    }
+    return lo;
+  }
+  // under a tree with the bird: keep the camera beneath the leaves instead of pulling it in
+  function camUnder(focus, cam){
+    // the lowest crown anywhere along the line of sight: get the camera under that
+    let b = null;
+    for(let i=1;i<=12;i++){ _cv.lerpVectors(focus, cam, i/12); const c = crownBase(_cv.x, _cv.z); if(c !== null && (b === null || c < b)) b = c; }
+    if(b === null) return 0;
+    if(focus.y > b){
+      // perched on top of a tree: lift over the crowns along the line of sight instead
+      let top = -1e9;
+      for(let i=1;i<=12;i++){ _cv.lerpVectors(focus, cam, i/12); const t = treeTopAt(_cv.x, _cv.z); if(t !== null && t > top) top = t; }
+      return Math.max(0, top + 1.5 - cam.y);
+    }
+    if(cam.y < b) return 0;
+    return Math.min(0, Math.max(b, terrainAt(cam.x, cam.z) + 1) - cam.y);   // how far to drop (negative)
+  }
+  const _sv = new THREE.Vector3();
+  function blocks(a, b){
+    const d = a.distanceTo(b), n = Math.max(2, Math.ceil(d/2));
+    for(let i=1;i<n;i++){ _sv.lerpVectors(a, b, i/n); if(terrainAt(_sv.x, _sv.z) > _sv.y) return true; }
+    return false;
+  }
+
+  // where birds that fly ahead wait: a ring on the goal hill
+  const roosts = [];
+  for(let i=0;i<14;i++){ const a = -Math.PI/2 + (i-6.5)*.3, r = 14 + (i%3)*3; roosts.push({x:GOAL.x+Math.cos(a)*r, z:GOAL.z+Math.sin(a)*r, y:null}); }
+  // a splash in the stream: a handful of droplets
+  const dropTex = dotTex(32, d=>{ const a=Math.max(0,1-d); return [255,252,244, 255*Math.min(1,a*1.6)]; });
+  const ND = 40, dPos = new Float32Array(ND*3).fill(-999), dVel = new Float32Array(ND*3), dLife = new Float32Array(ND);
+  const dGeo = new THREE.BufferGeometry(); dGeo.setAttribute('position', new THREE.BufferAttribute(dPos, 3));
+  const drops = new THREE.Points(dGeo, new THREE.PointsMaterial({map:dropTex, size:.22, transparent:true, depthWrite:false, opacity:.9}));
+  drops.frustumCulled = false; root.add(drops);
+  let dNext = 0;
+  function mSplash(x, z, vx, vz, p){
+    const y = waterAt(x, z) ?? terrainAt(x, z);
+    for(let k=0;k<20;k++){
+      const i = dNext, a = Math.random()*Math.PI*2, sp = (.5+Math.random()*1.6)*p; dNext = (dNext+1)%ND;
+      dPos[i*3] = x; dPos[i*3+1] = y + .05; dPos[i*3+2] = z;
+      dVel[i*3] = Math.cos(a)*sp + vx*.2; dVel[i*3+1] = (2+Math.random()*2.4)*p; dVel[i*3+2] = Math.sin(a)*sp + vz*.2; dLife[i] = .5+Math.random()*.4;
+    }
+  }
+  function dropTick(dt){
+    for(let i=0;i<ND;i++){
+      if(dLife[i] <= 0){ dPos[i*3+1] = -999; continue; }
+      dLife[i] -= dt; dVel[i*3+1] -= 9.8*dt;
+      dPos[i*3] += dVel[i*3]*dt; dPos[i*3+1] += dVel[i*3+1]*dt; dPos[i*3+2] += dVel[i*3+2]*dt;
+    }
+    dGeo.attributes.position.needsUpdate = true;
+  }
+  const blob = new THREE.Mesh(new THREE.PlaneGeometry(2,2), new THREE.MeshBasicMaterial({transparent:true, opacity:0, depthWrite:false}));
+  blob.visible = false; root.add(blob);
+  const start = new THREE.Vector3(S.start[0], terrainAt(S.start[0], S.start[2]), S.start[2]);
+  pickRestTree();
+
+  return {
+    root, enter(){ scene.background = new THREE.Color(S.fog); scene.fog = new THREE.Fog(S.fog, S.fogNear, S.fogFar); },
+    start, climbK:y=>1 - smooth(S.cap.soft, S.cap.hard, y), camFloor:(x,z)=>terrainAt(x,z) + 1.0,
+    get groundWall(){ return lastWall; }, get groundWater(){ return lastWater; }, groundN, slide:true, softKnock:true,
+    arriveMsg:'ゴールの丘に着いた。ゆっくりしたら「渡りを終える」', arriveTitle:'峠を越えた', bgm:'yamagoe',
+    rareMsg:'谷の奥に、光る羽が舞い降りた', escortMsg:n=>`丘の上で ${n} が待っていた。歌いかけてみよう`,
+    blocks, get groundUp(){ return lastNY; },
+    name:S.name, blob, splash:mSplash, groundAt, spots, useProps, isleRoosts:roosts, restName:'休みの木', camRoom, camUnder, trunkPush, get treeShape(){ return shape; }, get treeList(){ return trees; },
+    get rescue(){ return rescue; }, setEnvTex(){},
+    maxFlock:S.maxFlock, rare:S.rare,
+    roost(i){ const r = roosts[i % roosts.length]; if(r.y===null) r.y = groundAt(r.x, r.z) + .02; return r; },
+    isGoal:(x,z)=>Math.hypot(x-GOAL.x, z-GOAL.z) < GOAL_R,
+    goal:GOAL,
+    get trees(){ return trees.length; }, get bushCount(){ return bushes.length; }, terrainAt, get cap(){ return S.cap; }, land, axisX, paintLand,
+    hiddenAt, hawks:S.hawks, thermalAt, get fogK(){ return fogK; }, bushNear(x,z){ let b=null, bd=1e9; for(const o of bushes){ const d=Math.hypot(o.x-x,o.z-z); if(d<bd){ bd=d; b=o; } } return b; },
+    update(dt, cam, focus){
+      cloudTick(clouds, dt, cam, 300, 740, -1000, 1000);
+      wispTick(dt, cam);
+      { const U = water.material.uniforms; U.uT.value += dt; U.uNear.value = scene.fog.near*.6; U.uFar.value = scene.fog.far; }
+      dropTick(dt);
+      // the mist drifts and breathes with its cycle; the scene fog closes in a little at a time while you are in it
+      const fa = mistAt(focus, clock.elapsedTime);
+      for(const c of mists){
+        c.position.x += c.userData.v*dt;
+        c.position.y += (mistY(c) - c.position.y)*Math.min(1, dt);
+        // close up a card is just a flat sheet: it fades as the camera comes near, and the scene fog takes over
+        const d = c.position.distanceTo(cam.position);
+        c.material.opacity = (.15 + .35*fa.zone)*smooth(c.scale.x*.35, c.scale.x*.9, d);
+      }
+      fogK += (fa.k - fogK)*Math.min(1, .5*dt);
+      scene.fog.near = THREE.MathUtils.lerp(S.fogNear, 14, fogK);
+      scene.fog.far = THREE.MathUtils.lerp(S.fogFar, 95, fogK);
+      sky.position.copy(cam.position);
+      beam.rotation.y = Math.atan2(cam.position.x - GOAL.x, cam.position.z - GOAL.z);   // always face the camera
+      beam.material.opacity = .35 + .15*Math.sin(clock.elapsedTime*1.1);
+      hills.position.set(cam.position.x, 0, cam.position.z);
+    }
+  };
+}
+
+/* the stage being flown. picked on the title screen; everything else asks `stage`.
+   the sea is built at load; other days on first use (makers), then kept */
+const STAGE_MAKERS = {mountain:makeMountainStage};
+const ALL_STAGES = {sea:seaStage};
+function ensureStage(k){
+  if(!ALL_STAGES[k] && STAGE_MAKERS[k]){
+    const st = ALL_STAGES[k] = STAGE_MAKERS[k]();
+    st.useProps(propLib);                  // the models already loaded (later ones reach it through the props loader)
+  }
+  return ALL_STAGES[k];
+}
+let stage = seaStage;
+let blob = stage.blob;
+function setStage(k){
+  stage = ensureStage(k) || seaStage; blob = stage.blob;
+  for(const key in ALL_STAGES) ALL_STAGES[key].root.visible = (ALL_STAGES[key] === stage);
+  stage.enter();
+  $('sRescueName').textContent = stage.restName; $('kRescueName').textContent = stage.restName;
+}
+setStage('sea');
 
 /* ============ bird state ============ */
 let pHalo = null, pRare = false, pHaloVis = 1, pSpine = null;
@@ -1623,12 +2565,32 @@ let bounceT = 0, groundY = 0, splashCool = 0, splashFlash = 0, idleNext = 6;
 
 const GRAV = 9.81;
 const START_Y = 0;
+const _slide = new THREE.Vector3();
+let slideT = 0;                       // just slid off a hillside: the wings get no thrust for a moment
+let thermalK = 0;
+// rock faces (mountain): a knock costs a bird only when flown into hard, and only once per contact
+const KNOCK_SPEED = 9;                // m/s toward the face; cruising straight in is ~17, a glance at 30 deg ~8
+let wallContact = false, wallClearT = 0;
+const _wn = new THREE.Vector3(), _tp = new THREE.Vector3();
+// the way out of the rock the bird is touching: probe round it for open air
+function wallNormal(out){
+  const bx = bird.position.x, by = bird.position.y, bz = bird.position.z;
+  out.set(0,0,0);
+  for(let k=0;k<12;k++){
+    const a = k/12*Math.PI*2, sx = Math.sin(a), sz = Math.cos(a);
+    const g = stage.groundAt(bx + sx*1.8, bz + sz*1.8, by + 2);
+    if(g === null || g < by - .3 || (stage.slide && !stage.groundWall)){ out.x += sx; out.z += sz; }
+  }
+  if(out.lengthSq() < 1e-6) out.set(-V.x, 0, -V.z);
+  if(out.lengthSq() < 1e-6) out.set(-Math.sin(heading), 0, -Math.cos(heading));
+  return out.normalize();
+}                     // how deep into rising air the bird is, eased over a few seconds
 
 function reset(){
   if(finished) return;
   lookYaw = 0; lookPitch = 0; camZoom = setts.camDist;
   camReady = false; camSpd = 0; boost = 0;
-  bird.position.set(0, START_Y, 0);
+  bird.position.copy(stage.start);
   V.set(0,0,0);
   heading = 0; pitch = 0; roll = 0;
   grounded = true;
@@ -1672,7 +2634,7 @@ $('sCamBack').addEventListener('click', ()=>{ lookYaw = 0; lookPitch = 0; camZoo
 $('sRescue').addEventListener('click', ()=>{ openSettings(false); rescueToRock(); });
 $('sRestart').addEventListener('click', ()=>$('sRestartAsk').classList.add('on'));
 $('sRestartNo').addEventListener('click', ()=>$('sRestartAsk').classList.remove('on'));
-$('sRestartYes').addEventListener('click', ()=>{ $('sRestartAsk').classList.remove('on'); openSettings(false); restartDay(); });
+$('sRestartYes').addEventListener('click', ()=>{ $('sRestartAsk').classList.remove('on'); openSettings(false); toTitle(); });
 
 let settingsOpen = false;
 function openSettings(on){
@@ -2046,7 +3008,7 @@ function takeModels(files){
       const [name, sc] = it, mm = name.toLowerCase().match(PROP_RE), k = propKey(mm);
       propLib[k].push(sc);
     }
-    stage.useProps(propLib);
+    for(const k in ALL_STAGES) ALL_STAGES[k].useProps(propLib);
     const n = list.filter(Boolean).length;
     $('glbname').textContent = ($('glbname').dataset.bird || '') + `　部品 ${n}`;
   });
@@ -2066,7 +3028,7 @@ const BUILTIN_PROPS = {"isle_goal_01.glb":"Z2xURgIAAACsZwAA1A8AAEpTT057CiJhc3Nld
       const mm = it[0].toLowerCase().match(PROP_RE); if(!mm) continue;
       propLib[propKey(mm)].push(it[1]);
     }
-    stage.useProps(propLib);
+    for(const k in ALL_STAGES) ALL_STAGES[k].useProps(propLib);
   });
 })();
 
@@ -2184,7 +3146,8 @@ td.addEventListener('drop', e=>loadSkins(e.dataTransfer.files));
    moment the song begins */
 $('start').addEventListener('click', ()=>{
   if(!model) return;
-  Sound.init(); Sound.start('umi');
+  setStage(curStage);
+  Sound.init(); Sound.start(stage.bgm);
   buildRoster(); paintSkin();
   spawnMates();
   document.body.classList.add('ready');
@@ -2212,6 +3175,7 @@ const camAim = new THREE.Vector3();
 const camFocus = new THREE.Vector3();
 const CAM_V_FOLLOW = 1.3, CAM_V_LAG = 1.8;
 let camSpd = 0;
+let camRoomK = 1, camDropY = 0;       // trees in the way: how far out the camera may sit, and how far it sinks below the crowns
 /* the view's own heading. it used to be locked to the bird's, so every
    turn spun the whole world at once, from the first frame. now it trails:
    the bird banks and swings round in the picture first, and the view
@@ -2237,7 +3201,7 @@ function flight(dt){
     boost = Math.min(4, boost + 1); boostT = .7; flapAnimT = .5;
     flock.forEach((m,i)=>{ m.burstAt = clock.elapsedTime + .05 + i*.06; });
     V.addScaledVector(new THREE.Vector3(Math.sin(heading),0,Math.cos(heading)), 2.4);
-    V.y += 1.4;
+    V.y += 1.4*stage.climbK(bird.position.y);
   }
   const lift     = grounded ? (flapKey ? 1 : 0) : Math.max(0, up);
   const sinkIn   = (bounceT > 0 || grounded) ? 0 : Math.max(0, -up);
@@ -2276,30 +3240,41 @@ function flight(dt){
   fwd.set(Math.sin(heading), 0, Math.cos(heading));
 
   // --- thrust: cruise in the air, roll to a stop on the ground ---
-  const CRUISE = grounded ? 0 : (gliding ? 17.0 : 12.5) + boost*3.2;
+  // rising air takes hold at once (the slow build-up read as nothing happening), and lets go a little slower
+  const thAt = stage.thermalAt && !grounded ? stage.thermalAt(bird.position) : 0;
+  thermalK += (thAt - thermalK) * Math.min(1, (thAt > thermalK ? 5 : 1.5)*dt);
+  const CRUISE = grounded ? 0 : (gliding ? 17.0 : 12.5) + boost*3.2 + thermalK*4;
   const along = V.dot(fwd);
-  V.addScaledVector(fwd, (CRUISE - along) * (grounded ? 4.0 : 1.6) * dt);
+  slideT -= dt;
+  V.addScaledVector(fwd, (CRUISE - along) * (grounded ? 4.0 : 1.6) * (slideT > 0 ? 0 : 1) * dt);
 
   // bleed off any sideways drift so turns feel clean
   const side = new THREE.Vector3(Math.cos(heading),0,-Math.sin(heading));
   V.addScaledVector(side, -V.dot(side) * 3.0 * dt);
 
   // --- altitude: flap up, sink down. nothing else touches it. ---
-  const CLIMB = 7.0, SINK = gliding ? 1.9 : 3.6, DIVE = 9.0;
+  // on the mountain the climb thins out toward the cloud ceiling (nothing pushes down: it just stops lifting)
+  const CLIMB = 7.0*stage.climbK(bird.position.y - thermalK*80), SINK = gliding ? 1.9 : 3.6, DIVE = 9.0;   // rising air lifts the ceiling too
   const targetY = grounded   ? 0
                 : bounceT > 0 ? CLIMB
                 : lift > 0    ? THREE.MathUtils.lerp(-SINK, CLIMB, lift)
                 : diveOn      ? -24
                 : diving      ? THREE.MathUtils.lerp(-SINK, -DIVE, sinkIn)
                 :               -SINK;
-  V.y += (targetY - V.y) * Math.min(1, (diveOn ? 2.2 : 3.4)*dt);
+  V.y += (targetY + (grounded || diveOn ? 0 : thermalK*14) - V.y) * Math.min(1, (diveOn ? 2.2 : (thermalK > .2 ? 6 : 3.4))*dt);
   if(diveOn) V.addScaledVector(fwd, 6*dt);        // falling gathers speed
 
   if(flapping && !grounded) flapT -= dt;
 
   bird.position.addScaledVector(V, dt);
+  // a tree trunk: slide round it
+  if(stage.trunkPush && stage.trunkPush(bird.position, .35, _tp)){
+    bird.position.add(_tp); const l = _tp.length();
+    if(l > 1e-4){ _tp.multiplyScalar(1/l); const vin = V.x*_tp.x + V.z*_tp.z; if(vin < 0){ V.x -= _tp.x*vin; V.z -= _tp.z*vin; } }
+  }
   // --- ground: only rocks and islands can be stood on ---
   splashCool -= dt; splashFlash -= dt;
+  wallClearT += dt; if(wallClearT > .6) wallContact = false;
   const gh = stage.groundAt(bird.position.x, bird.position.z, bird.position.y + 2);
   if(grounded && gh === null){            // walked off the edge
     grounded = false;
@@ -2311,7 +3286,43 @@ function flight(dt){
   } else if(gh !== null && (bird.position.y <= gh || (grounded && bird.position.y <= gh + .05))){   // standing: tiny ray rounding must not count as airborne
     // the goal island never knocks birds off: brushing it counts as arriving
     const steep = stage.groundUp < .7;     // the side of a rock: bounce off it, never cling to it
-    if(!grounded && (bird.position.y < gh - 1.2 || steep) && !stage.isGoal(bird.position.x, bird.position.z)){
+    if(stage.groundWater){
+      // the stream: a splash and a beat back up. it is shallow and quick; nobody is lost to it
+      bird.position.y = gh;
+      if(splashCool <= 0){ stage.splash(bird.position.x, bird.position.z, V.x, V.z, .8); splashCool = .35; splashFlash = .9; }
+      V.x *= .7; V.z *= .7; V.y = 6.5; bounceT = .55; grounded = false;
+      play('takeoff', .08);
+      setTimeout(()=>{ if(!grounded) play('flying',0.3); }, clipMs('takeoff', 450) - 150);
+    } else if(!grounded && (bird.position.y < gh - 1.2 || steep) && !stage.isGoal(bird.position.x, bird.position.z) && stage.slide && !stage.groundWall){
+      // a mountainside: slide off it downhill. nobody is lost on a slope, only on a rock face
+      bird.position.y = gh + .05;
+      const n = stage.groundN, vn = V.dot(n);
+      if(vn < 0) V.addScaledVector(n, -vn);                      // nothing goes into the hill
+      const dl = Math.hypot(n.x, n.z);
+      if(dl > 1e-3){                                              // and the hill carries the bird down its fall line
+        _slide.set(n.x/dl, 0, n.z/dl);
+        const along = V.x*_slide.x + V.z*_slide.z;
+        if(along < 6) V.addScaledVector(_slide, (6-along)*Math.min(1, 6*dt));
+        V.y = Math.min(V.y, -Math.max(along, 0)*dl/Math.max(n.y, .2) - .5);   // hug the slope on the way down
+      } else V.y = Math.min(V.y, -1);
+      slideT = .3;
+      if(current !== clips.glide) play('glide', .2);
+    } else if(!grounded && (bird.position.y < gh - 1.2 || steep) && !stage.isGoal(bird.position.x, bird.position.z) && stage.softKnock){
+      // a rock face (mountain): what counts is how hard you fly INTO it, not that you touched it.
+      // pushed out along the face's normal, turned a little away, no thrust for a moment;
+      // only a real head-on knock costs a bird, and only one per contact
+      wallNormal(_wn);
+      const into = -(V.x*_wn.x + V.z*_wn.z);              // speed toward the face
+      if(into > KNOCK_SPEED && !wallContact) loseOne();
+      wallContact = true; wallClearT = 0;
+      bird.position.x += _wn.x*.6; bird.position.z += _wn.z*.6;
+      if(into > 0){ V.x += _wn.x*into; V.z += _wn.z*into; }  // nothing goes on into the rock
+      V.x += _wn.x*4; V.z += _wn.z*4;                     // and a little bounce off it
+      V.y = Math.max(V.y, 2);
+      const away = Math.atan2(V.x, V.z);                  // turn toward where the bounce sends you
+      heading += wrapA(away - heading)*(into > KNOCK_SPEED ? .6 : .35);
+      slideT = .35;
+    } else if(!grounded && (bird.position.y < gh - 1.2 || steep) && !stage.isGoal(bird.position.x, bird.position.z)){
       // flew into the side of a rock: glance off instead of popping on top
       loseOne();
       bird.position.x -= V.x*dt*2; bird.position.z -= V.z*dt*2;
@@ -2324,7 +3335,7 @@ function flight(dt){
         V.multiplyScalar(0.1);
         idleNext = 5 + Math.random()*4;
         play('landing', 0.15);
-        if(stage.isGoal(bird.position.x, bird.position.z) && !isleToast){ isleToast = true; setTimeout(()=>toast('島に着いた。ゆっくりしたら「渡りを終える」'), 900); }
+        if(stage.isGoal(bird.position.x, bird.position.z) && !isleToast){ isleToast = true; setTimeout(()=>toast(stage.arriveMsg), 900); }
         setTimeout(()=>{ if(grounded && current===clips.landing) play('idle',0.4); }, clipMs('landing', 700));
       }
       V.y = Math.max(0, V.y);
@@ -2376,7 +3387,7 @@ function flight(dt){
       // stay on the rock: small steps up or down only, never off the edge
       // gentle slopes only (a rock face is a wall, not a ramp), and never below the waterline
       const stepLen = Math.hypot(nx-bird.position.x, nz-bird.position.z);
-      if(g2 !== null && g2 > 0.02 && Math.abs(g2 - bird.position.y) <= stepLen*0.8 + 0.02){
+      if(g2 !== null && g2 > 0.02 && !stage.groundWater && Math.abs(g2 - bird.position.y) <= stepLen*0.8 + 0.02){
         bird.position.set(nx, g2, nz); groundY = g2;
       }
       V.set(0,0,0);
@@ -2502,7 +3513,17 @@ function flight(dt){
     camFocus.z - Math.cos(eye)*Math.cos(elev)*dist
   );
   // never let the camera sink below the ground
-  camPos.y = Math.max(camPos.y, 0.4);
+  camPos.y = Math.max(camPos.y, stage.camFloor(camPos.x, camPos.z));
+  // among trees: come in toward the bird rather than sit inside the leaves. quick to come in, slow to go back out
+  if(stage.camRoom && !photo){
+    // under a tree with the bird: first sink below the leaves; whatever still cuts through a crown pulls the view in
+    const drop = stage.camUnder(camFocus, camPos);
+    camDropY += (drop - camDropY) * Math.min(1, (Math.abs(drop) > Math.abs(camDropY) ? 6 : 1.5)*dt);
+    camPos.y += camDropY;
+    const room = stage.camRoom(camFocus, camPos);
+    camRoomK += (room - camRoomK) * Math.min(1, (room < camRoomK ? 7 : 1.2)*dt);
+    if(camRoomK < .999) camPos.sub(camFocus).multiplyScalar(camRoomK).add(camFocus);
+  } else { camRoomK = 1; camDropY = 0; }
   // the dance circles slowly: if the hill comes between us and the flock,
   // hold the turn and lift over it, and only ease back down once it's clear
   if(finale){
@@ -2607,12 +3628,23 @@ const Sound = (()=>{
       lfo.connect(lg); lg.connect(a.frequency); lg.connect(b.frequency);
       a.connect(g); b.connect(g2); g2.connect(g); a.onended=()=>{ g.disconnect(); g2.disconnect(); };
     },
+    // the mountain song's melody: a soft, felted piano (from ほしの音楽会, same nodes and the same disconnect on ended)
+    feltpiano(t,m,d,v){
+      const f=m2f(m), rel=Math.min(d*1.6+.4,2.2), stop=t+.012+rel+.05;
+      const lp=ctx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=2000;
+      const g=envGain(t,cl(v/127,.05,1)*.32,.012,rel,bgm,.5);
+      const a=osc('sine',f,t,stop), b=osc('sine',f*2,t,stop);
+      const g2=ctx.createGain(); g2.gain.value=.08;
+      a.connect(lp); b.connect(g2); g2.connect(lp); lp.connect(g);
+      a.onended=()=>{ g.disconnect(); g2.disconnect(); lp.disconnect(); };
+    },
   };
 
   /* every piece is note data. umi plays in the field, hajimari (a stand-in
      until the book gets its own piece) in the 仲間図鑑 */
   const TRACKS = {
     umi:      {song:SONG, inst:{melody:'flue', arp:'triangle', pad:'pad', bass:'bass'}},
+    yamagoe:  {song:{"id":"yamagoe02","title":"やまごえのうた","subtitle":"〜二日目・山越え〜","bpm":75,"loopSec":51.2,"color":"#a8d0e6","melody":[[0.0,86,1.6,72],[1.6,82,0.8,64],[2.4,81,0.8,58],[3.2,86,0.8,70],[4.0,88,0.8,66],[4.8,89,1.6,74],[6.4,89,0.8,72],[7.2,86,0.8,64],[8.0,82,1.6,60],[9.6,84,0.8,66],[10.4,88,0.8,62],[11.2,79,1.6,56],[12.8,81,1.6,68],[14.4,86,1.6,64],[16.0,82,0.8,70],[16.8,79,0.8,62],[17.6,86,1.6,66],[19.2,85,1.6,74],[20.8,88,0.8,70],[21.6,81,0.8,60],[22.4,76,3.2,54],[25.6,89,0.8,80],[26.4,93,1.6,86],[28.0,91,0.8,72],[28.8,88,0.8,76],[29.6,91,0.8,78],[30.4,84,1.6,66],[32.0,89,1.6,78],[33.6,86,0.8,68],[34.4,89,0.8,70],[35.2,81,0.8,62],[36.0,84,0.8,66],[36.8,77,1.6,58],[38.4,79,0.8,60],[39.2,82,0.8,64],[40.0,86,1.6,68],[41.6,89,1.6,72],[43.2,86,0.8,62],[44.0,84,0.8,58],[44.8,85,1.6,70],[46.4,88,0.8,64],[47.2,86,0.8,56],[48.0,86,3.2,60]],"arp":[[0.0,62,0.8,46],[0.8,69,0.8,42],[1.6,74,0.8,48],[2.4,77,0.8,44],[3.2,58,0.8,46],[4.0,65,0.8,42],[4.8,70,0.8,48],[5.6,74,0.8,44],[6.4,60,0.8,46],[7.2,67,0.8,42],[8.0,72,0.8,48],[8.8,76,0.8,44],[9.6,62,0.8,46],[10.4,69,0.8,42],[11.2,74,0.8,48],[12.0,77,0.8,44],[12.8,62,0.8,46],[13.6,69,0.8,42],[14.4,74,0.8,48],[15.2,77,0.8,44],[16.0,55,0.8,46],[16.8,62,0.8,42],[17.6,67,0.8,48],[18.4,70,0.8,44],[19.2,57,0.8,46],[20.0,64,0.8,42],[20.8,69,0.8,48],[21.6,73,0.8,44],[22.4,57,0.8,46],[23.2,64,0.8,42],[24.0,69,0.8,48],[24.8,73,0.8,44],[25.6,65,0.4,46],[26.0,72,0.4,48],[26.4,77,0.4,50],[26.8,81,0.4,52],[27.2,65,0.4,46],[27.6,72,0.4,48],[28.0,77,0.4,50],[28.4,81,0.4,52],[28.8,60,0.4,46],[29.2,67,0.4,48],[29.6,72,0.4,50],[30.0,76,0.4,52],[30.4,60,0.4,46],[30.8,67,0.4,48],[31.2,72,0.4,50],[31.6,76,0.4,52],[32.0,58,0.4,46],[32.4,65,0.4,48],[32.8,70,0.4,50],[33.2,74,0.4,52],[33.6,58,0.4,46],[34.0,65,0.4,48],[34.4,70,0.4,50],[34.8,74,0.4,52],[35.2,65,0.4,46],[35.6,72,0.4,48],[36.0,77,0.4,50],[36.4,81,0.4,52],[36.8,65,0.4,46],[37.2,72,0.4,48],[37.6,77,0.4,50],[38.0,81,0.4,52],[38.4,55,0.8,46],[39.2,62,0.8,42],[40.0,67,0.8,48],[40.8,70,0.8,44],[41.6,58,0.8,46],[42.4,65,0.8,42],[43.2,70,0.8,48],[44.0,74,0.8,44],[44.8,57,0.8,46],[45.6,64,0.8,42],[46.4,69,0.8,48],[47.2,73,0.8,44],[48.0,62,0.8,46],[48.8,69,0.8,42],[49.6,74,0.8,48],[50.4,77,0.8,44]],"pad":[[0.0,50,3.2,30],[0.0,57,3.2,30],[0.0,62,3.2,30],[3.2,46,3.2,30],[3.2,53,3.2,30],[3.2,58,3.2,30],[6.4,48,3.2,30],[6.4,55,3.2,30],[6.4,60,3.2,30],[9.6,50,3.2,30],[9.6,57,3.2,30],[9.6,62,3.2,30],[12.8,50,3.2,30],[12.8,57,3.2,30],[12.8,62,3.2,30],[16.0,43,3.2,30],[16.0,50,3.2,30],[16.0,55,3.2,30],[19.2,45,3.2,30],[19.2,52,3.2,30],[19.2,57,3.2,30],[22.4,45,3.2,30],[22.4,52,3.2,30],[22.4,57,3.2,30],[25.6,53,3.2,36],[25.6,57,3.2,36],[25.6,60,3.2,36],[28.8,48,3.2,36],[28.8,52,3.2,36],[28.8,55,3.2,36],[32.0,46,3.2,36],[32.0,50,3.2,36],[32.0,53,3.2,36],[35.2,53,3.2,36],[35.2,57,3.2,36],[35.2,60,3.2,36],[38.4,43,3.2,30],[38.4,50,3.2,30],[38.4,55,3.2,30],[41.6,46,3.2,30],[41.6,53,3.2,30],[41.6,58,3.2,30],[44.8,45,3.2,30],[44.8,52,3.2,30],[44.8,57,3.2,30],[48.0,50,3.2,30],[48.0,57,3.2,30],[48.0,62,3.2,30]],"bass":[[0.0,38,2.4,48],[3.2,34,2.4,48],[6.4,36,2.4,48],[9.6,38,2.4,48],[12.0,50,0.8,40],[12.8,38,2.4,48],[16.0,31,2.4,48],[19.2,33,2.4,48],[22.4,33,2.4,48],[25.6,41,2.4,48],[28.8,36,2.4,48],[32.0,34,2.4,48],[35.2,41,2.4,48],[37.6,53,0.8,40],[38.4,31,2.4,48],[41.6,34,2.4,48],[44.8,33,2.4,48],[48.0,38,2.4,48],[50.4,50,0.8,40]],"instruments":{"melody":"feltpiano"}}, inst:{melody:'feltpiano', arp:'triangle', pad:'pad', bass:'bass'}},
     hajimari: {song:{"id":"hajimari00","title":"\u306f\u3058\u307e\u308a\u306e\u30ef\u30eb\u30c4","subtitle":"\u301c\u958b\u6f14\u306e\u307e\u3048\u306b\u301c","bpm":100,"loopSec":30.6,"color":"#a8d8ff","melody":[[0.0,74,0.6,76],[0.6,79,0.3,64],[0.9,83,0.3,64],[1.2,86,0.6,78],[1.8,84,0.6,76],[2.4,83,0.3,64],[2.7,81,0.3,64],[3.0,79,0.6,70],[3.6,83,0.6,76],[4.2,81,0.3,64],[4.5,79,0.3,64],[4.8,78,0.6,70],[5.4,79,1.2,76],[6.6,74,0.6,70],[7.2,74,0.45,50],[9.0,86,0.6,84],[9.6,84,0.3,64],[9.9,83,0.3,64],[10.2,81,0.6,70],[10.8,79,0.6,70],[11.4,76,0.3,64],[11.7,79,0.3,64],[12.0,84,0.6,70],[12.6,83,0.6,76],[13.2,81,0.3,64],[13.5,79,0.3,64],[13.8,78,0.6,70],[14.4,79,1.2,64],[16.2,83,0.6,66],[16.8,86,0.6,72],[17.4,88,0.6,76],[18.0,91,1.2,84],[19.2,86,0.6,70],[19.8,88,0.6,72],[20.4,86,0.6,66],[21.0,83,0.6,62],[21.6,81,1.2,68],[22.8,86,0.6,64],[23.4,88,0.6,70],[24.0,91,0.6,78],[24.6,93,0.6,82],[25.2,90,1.2,74],[26.4,81,0.6,60],[27.0,86,0.5,64],[27.5,83,0.5,58],[28.0,81,0.5,52]],"arp":[[0.0,67,0.6,46],[0.6,71,0.6,46],[1.2,62,0.6,46],[1.8,60,0.6,46],[2.4,64,0.6,46],[3.0,67,0.6,46],[3.6,62,0.6,46],[4.2,66,0.6,46],[4.8,69,0.6,46],[5.4,67,0.6,46],[6.0,71,0.6,46],[6.6,62,0.6,46],[7.2,62,0.6,46],[7.8,66,0.6,46],[8.4,69,0.6,46],[9.0,64,0.6,46],[9.6,67,0.6,46],[10.2,72,0.6,46],[10.8,60,0.6,46],[11.4,64,0.6,46],[12.0,67,0.6,46],[12.6,62,0.6,46],[13.2,66,0.6,46],[13.8,69,0.6,46],[14.4,67,0.6,46],[15.0,71,0.6,46],[15.6,62,0.6,46],[16.2,52,0.6,44],[16.8,59,0.6,46],[17.4,67,0.6,48],[18.0,48,0.6,44],[18.6,55,0.6,46],[19.2,64,0.6,48],[19.8,43,0.6,44],[20.4,50,0.6,46],[21.0,59,0.6,48],[21.6,50,0.6,44],[22.2,57,0.6,46],[22.8,66,0.6,48],[23.4,48,0.6,44],[24.0,55,0.6,46],[24.6,64,0.6,48],[25.2,50,0.6,44],[25.8,57,0.6,46],[26.4,66,0.6,48],[27.0,67,0.6,40]],"pad":[[0.0,43,1.8,28],[0.0,47,1.8,28],[0.0,50,1.8,28],[1.8,48,1.8,28],[1.8,52,1.8,28],[1.8,55,1.8,28],[3.6,50,1.8,28],[3.6,54,1.8,28],[3.6,57,1.8,28],[5.4,43,1.8,28],[5.4,47,1.8,28],[5.4,50,1.8,28],[7.2,50,1.8,28],[7.2,54,1.8,28],[7.2,57,1.8,28],[9.0,40,1.8,28],[9.0,43,1.8,28],[9.0,47,1.8,28],[10.8,48,1.8,28],[10.8,52,1.8,28],[10.8,55,1.8,28],[12.6,50,1.8,28],[12.6,54,1.8,28],[12.6,57,1.8,28],[14.4,43,1.8,28],[14.4,47,1.8,28],[14.4,50,1.8,28],[16.2,52,1.8,32],[16.2,55,1.8,32],[16.2,59,1.8,32],[18.0,48,1.8,32],[18.0,52,1.8,32],[18.0,55,1.8,32],[19.8,43,1.8,36],[19.8,47,1.8,36],[19.8,50,1.8,36],[19.8,55,1.8,36],[21.6,50,1.8,32],[21.6,54,1.8,32],[21.6,57,1.8,32],[21.6,62,1.8,32],[23.4,48,1.8,32],[23.4,52,1.8,32],[23.4,55,1.8,32],[25.2,50,1.8,36],[25.2,54,1.8,36],[25.2,57,1.8,36],[25.2,62,1.8,36],[27.0,43,1.8,22],[27.0,47,1.8,22],[27.0,50,1.8,22]],"bass":[[0.0,31,1.2,44],[1.8,36,1.2,44],[3.6,38,1.2,44],[5.4,31,1.2,44],[7.2,38,1.2,44],[9.0,28,1.2,44],[10.8,36,1.2,44],[12.6,38,1.2,44],[14.4,31,1.2,44],[16.2,28,1.2,44],[18.0,36,1.2,44],[19.8,31,1.2,44],[21.6,38,1.2,44],[23.4,36,1.2,44],[25.2,38,1.2,44],[22.8,50,0.6,38],[24.599999999999998,48,0.6,38]]}, inst:{melody:'musicbox', arp:'triangle', pad:'pad', bass:'bass'}},
   };
   for(const k in TRACKS){
@@ -2697,15 +3729,18 @@ const Sound = (()=>{
     if(ctx) master.gain.setTargetAtTime(muted?0:.6, ctx.currentTime, .05);
     return muted;
   }
+  let ducked = false;
   function setBgm(on){
     bgmOn = on;
-    if(ctx) bgm.gain.setTargetAtTime(on ? .75 : 0, ctx.currentTime, .05);
+    if(ctx) bgm.gain.setTargetAtTime(on ? (ducked ? .42 : .75) : 0, ctx.currentTime, .05);
   }
+  // under cover the song comes down a little, and back up on leaving
+  function duck(on){ ducked = on; if(ctx && bgmOn) bgm.gain.setTargetAtTime(on ? .42 : .75, ctx.currentTime, .35); }
   function wake(){ if(ctx && ctx.state !== 'running' && ctx.state !== 'closed') ctx.resume().catch(()=>{}); }
   addEventListener('pointerdown', wake, true);
   addEventListener('keydown', wake, true);
   document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) wake(); });
-  return {init, start, switchTo, chord, chirp, toggleMute, setBgm, wake, get ready(){ return !!ctx; }, get playing(){ return gen > 0; }};
+  return {init, start, switchTo, chord, chirp, toggleMute, setBgm, duck, wake, get ready(){ return !!ctx; }, get playing(){ return gen > 0; }};
 })();
 
 /* ============ floating notes ============ */
@@ -2778,6 +3813,7 @@ function nameOf(def){ try{ const e = zukan.birds[def.id]; if(e && e.nick) return
    their rocks, one reserve who takes a rock when the player is flying as
    one of the locals, and two or more rares so a rare the player is flying
    as is replaced by another. names and looks marked 仮 are placeholders. ---- */
+const DEV_OPEN = false;          // dev: every day can be picked. the public build sets this false
 const STAGE_INFO = {
   sea:      {label:'一日目・海渡り', short:'海渡り', next:null, ready:true},
   mountain: {label:'二日目・山越え', short:'山越え', ready:false},
@@ -2799,21 +3835,41 @@ const BIRDS = {
       {id:'tsuki', name:'つき', tex:'rare2', need:5, trait:'しずかな光', rare:true, glow:[210,228,255], glowHex:0xb8d4ff, tint:0xe4efff},
     ],
   },
+  // real mountain birds, painted on the same round body. species shown in the book.
+  // skins are stand-ins (sea textures by number) until tex_bird_NN_<id> are drawn.
+  mountain:{
+    mates:[
+      {id:'wakaba', name:'わかば', species:'メジロ',     tex:4, need:3, spot:0, trait:'目のまわりが白い'},
+      {id:'kuri',   name:'くり',   species:'ヤマガラ',   tex:1, need:4, spot:2, trait:'木の実をためこむ'},
+      {id:'nekuta', name:'ねくた', species:'シジュウカラ', tex:0, need:3, spot:1, trait:'黒いネクタイ'},
+      {id:'fue',    name:'ふえ',   species:'ウソ',       tex:2, need:6, spot:5, trait:'口笛のような声'},
+      {id:'hinata', name:'ひなた', species:'キビタキ',   tex:3, need:5, spot:3, trait:'日なたの色'},
+      {id:'jobiko', name:'じょびこ', species:'ジョウビタキ', tex:2, need:5, spot:4, trait:'尾をふるわせる', size:.96},
+    ],
+    reserve:{id:'goma', name:'ごま', species:'コガラ', tex:0, need:4, trait:'小さな黒い帽子', size:.95, reserve:true},
+    rareSpot:6,
+    rares:[
+      {id:'ruri',     name:'るり',     species:'ルリビタキ',   tex:'rare2', need:5, trait:'青い光', rare:true, glow:[190,215,255], glowHex:0x9fc2ff, tint:0xdce9ff},
+      {id:'kanmuri',  name:'かんむり', species:'キクイタダキ', tex:'rare',  need:5, trait:'頭の金色', rare:true, glow:[255,236,170], glowHex:0xffd27a, tint:0xfff0c2, size:.85, spotIdx:7},
+    ],
+  },
 };
 let curStage = 'sea';
 // every bird that can appear in the book, in book order, tagged with its stage
-const ESCORT = {id:'shirube', name:'しるべ', tex:'escort', size:1.18, escort:true, stage:'sea', trait:'残った子を迎えに来る'};
+const ESCORT = {id:'shirube', name:'しるべ', tex:'escort', size:1.18, escort:true, stage:'sea', trait:'残った子を迎えに来る', glow:[255,246,222]};
 const CATALOG = [PLAYER_DEF, ESCORT];
-for(const st in BIRDS){ const B = BIRDS[st]; for(const d of [...B.mates, B.reserve, ...B.rares]){ d.stage = st; CATALOG.push(d); } }
+// a day that can't be flown yet (the public build closes the mountain) keeps its birds out of the book and its count
+for(const st in BIRDS){ if(!STAGE_INFO[st].ready) continue; const B = BIRDS[st]; for(const d of [...B.mates, B.reserve, ...B.rares]){ d.stage = st; CATALOG.push(d); } }
 const defById = id=>CATALOG.find(d=>d.id===id) || PLAYER_DEF;
 function leadDef(){ try{ return defById(zukan.player || 'me'); }catch(_){ return PLAYER_DEF; } }
 // today's lone birds: the player's own choice never waits on a rock as well
 let MATES = [];
 function buildRoster(){
   const B = BIRDS[curStage], pid = leadDef().id, list = [];
+  if(!B){ MATES = []; return; }          // a stage with no birds yet
   for(const d of B.mates) list.push(d.id===pid ? Object.assign({}, B.reserve, {spot:d.spot}) : d);
   const rare = B.rares.find(r=>r.id!==pid);
-  if(rare) list.push(Object.assign({}, rare, {spot:B.rareSpot}));
+  if(rare) list.push(Object.assign({}, rare, {spot:rare.spotIdx ?? B.rareSpot}));   // a rare may have a roost of its own
   MATES = list;
 }
 buildRoster();
@@ -2842,6 +3898,9 @@ const HEAR0 = 32;                        // how far a song carries alone
 const hearR = ()=>HEAR0 + flock.length*2.5;
 const needFor = m=>Math.max(2, m.need - Math.floor(flock.length/2));
 let escort = null, convoy = [], gathered = false, fullShown = false, rareShown = false, chorusAt = 0;
+const hawks = []; let taken = [];
+let scaredUntil = 0;                      // a hawk called: the small birds freeze and look up until then        // the enemy, and the mates it carried off this run
+let hidden = false;                       // is the player under cover right now
 let gltfSrc = null, modelK = 1, modelFoot = 0;
 const mates = [];
 let flock = [];                          // join order; the last one is the first to be lost
@@ -2873,14 +3932,14 @@ class Mate {
     this.model = m; this.tilt.add(m); scene.add(this.g);
     this.mixer = new THREE.AnimationMixer(m);
     this.acts = {};
-    for(const w of ['idle','takeoff','flying','glide','landing','hover','peck','preen','sing','peer','alert','walk','hop','hop_big','sing_hop','dive_in','dive']){
+    for(const w of ['idle','takeoff','flying','glide','landing','hover','peck','preen','sing','peer','alert','walk','hop','hop_big','sing_hop','dive_in','dive','struggle']){
       const c = gltfSrc.animations.find(c=>c.name.toLowerCase()===w);
       if(c) this.acts[w] = this.mixer.clipAction(c);
     }
     this.vel = new THREE.Vector3();
     this.tscale = .88 + Math.random()*.24;     // each bird beats at its own pace
-    if(def.rare){
-      // placeholder glow until a glow texture exists: pulsing emissive plus a soft halo
+    if(def.rare || def.escort){
+      // placeholder glow until a glow texture exists: pulsing emissive plus a soft halo (the guide: a soft light while it waits, so it can be found again)
       const N=64, px=new Uint8Array(N*N*4);
       for(let y=0;y<N;y++) for(let x=0;x<N;x++){
         const d=Math.hypot(x-N/2+.5,y-N/2+.5)/(N/2), a=Math.max(0,1-d);
@@ -2893,7 +3952,7 @@ class Mate {
       // and faded out instead when a rock actually stands between it and the camera
       this.halo.material.depthTest = false;
       this.halo.renderOrder = 10;
-      this.halo.scale.setScalar(1.8);
+      this.halo.scale.setScalar(def.escort ? 3.2 : 1.8);
       this.haloVis = 1; this.haloBase = .5;
       scene.add(this.halo);
     }
@@ -2948,7 +4007,8 @@ class Mate {
   /* standing about: back to idle after landing or singing, then the odd peck or preen */
   groundIdle(dt, now){
     if(now < this.singUntil) return;
-    if(['walk','hop','sing','hover','peer'].includes(this.curName)) this.play('idle', .3);
+    if(now < scaredUntil && this.acts.alert){ this.play('alert', .2); return; }   // a hawk about: frozen, looking up
+    if(['walk','hop','sing','hover','peer','alert'].includes(this.curName)) this.play('idle', .3);
     if(this.curName==='landing' && now - (this.landAt||0) > .7) this.play('idle', .35);
     this.fidget = (this.fidget ?? (3 + Math.random()*6)) - dt;
     if(this.fidget <= 0 && this.curName==='idle'){
@@ -3002,6 +4062,7 @@ class Mate {
       if(d>0 && d<1.3) this.vel.addScaledVector(_w, (1.3-d)/d*6*dt);
     }
     this.g.position.addScaledVector(this.vel, dt);
+    if(stage.trunkPush && stage.trunkPush(this.g.position, .3, _tp)) this.g.position.add(_tp);   // round tree trunks
     // solid ground: a flying bird never passes into rock or island
     const gh = stage.groundAt(this.g.position.x, this.g.position.z, this.g.position.y + 2);
     if(gh !== null && this.g.position.y < gh){ this.g.position.y = gh; if(this.vel.y < 0) this.vel.y = 0; }
@@ -3032,7 +4093,9 @@ class Mate {
       }
     }
     const P = bird.position;
-    if(this.halo){
+    if(this.halo && this.def.escort){
+      this.haloBase = .3 + .2*(.5 + .5*Math.sin(now*1.6));
+    } else if(this.halo){
       const pulse = .5 + .5*Math.sin(now*2.4);
       this.haloBase = .28 + .3*pulse;
       this.model.traverse(o=>{ if(o.isMesh && o.material.emissive) o.material.emissiveIntensity = .12 + .22*pulse; });
@@ -3063,6 +4126,8 @@ class Mate {
       break;
     }
     case 'absent': break;
+    case 'caught': break;               // carried by a hawk: it moves this bird
+    case 'taken': break;                // carried off for good this run
     case 'hold': this.face(dt, escort.g.position); if(now > this.singUntil && this.curName!=='idle') this.play('idle',.35); break;
     case 'away': break;
     case 'arriving': {                 // the rare one drops in from far off
@@ -3095,7 +4160,7 @@ class Mate {
       this.face(dt, bird.position);
       if(this.state === 'isleWait' && now > (this.callAt||0)){
         this.callAt = now + 3.5 + Math.random()*2;
-        if(this.g.position.distanceTo(bird.position) < 90) this.chorus(lastPitch || 79, now, 0);
+        if(this.g.position.distanceTo(bird.position) < 160) this.chorus(lastPitch || 79, now, 0);
       }
       break;
     }
@@ -3163,9 +4228,10 @@ class Mate {
       }
       this.face(dt, d < 45 ? P : null);
       if(now > this.singUntil){
-        if(d < 45 && !grounded && this.acts.peer) this.play('peer', .35);
+        if(now < scaredUntil && this.acts.alert) this.play('alert', .2);
+        else if(d < 45 && !grounded && this.acts.peer) this.play('peer', .35);
         else {
-          if(this.curName==='sing' || this.curName==='peer') this.play('idle', .35);
+          if(this.curName==='sing' || this.curName==='peer' || this.curName==='alert') this.play('idle', .35);
           this.fidget -= dt;
           if(this.fidget <= 0 && this.curName==='idle'){
             const n = Math.random()<.5 ? 'peck' : 'preen';
@@ -3200,7 +4266,8 @@ class Mate {
       if(!grounded){
         if(this.state==='ground'){ this.state='follow'; this.vel.y = 5; this.play('takeoff',.1);
           setTimeout(()=>{ if(this.state==='follow') this.play('flying',.3); }, 350); }
-        _h.set(P.x + rx*side - fx*row*1.55, P.y + .25*row, P.z + rz*side - fz*row*1.55);
+        const huddle = now < scaredUntil ? .7 : 1;           // a hawk about: they close in and beat faster
+        _h.set(P.x + rx*side*huddle - fx*row*1.55*huddle, P.y + .25*row, P.z + rz*side*huddle - fz*row*1.55*huddle);
         const far = this.g.position.distanceTo(_h);
         // never slower than the player: when you speed up, so do they
         this.steer(dt, _h, V, V.length()*1.15 + 6, 2.2 + Math.min(3, far*.08));
@@ -3218,7 +4285,7 @@ class Mate {
           } else {
             const burst = this.burstAt && now >= this.burstAt && now < this.burstAt + .55;
             this.play((autoGlide && !burst) && this.vel.y < 1 ? 'glide' : 'flying');
-            if(this.acts.flying) this.acts.flying.timeScale = this.tscale * (burst ? 1.45 : 1 + boost*.14);
+            if(this.acts.flying) this.acts.flying.timeScale = this.tscale * (burst ? 1.45 : 1 + boost*.14) * (now < scaredUntil ? 1.35 : 1);
           }
         }
       } else if(this.state==='follow'){
@@ -3299,10 +4366,13 @@ class Mate {
 
 function spawnMates(){
   for(const m of mates){ scene.remove(m.g); if(m.halo) scene.remove(m.halo); }
-  if(escort) scene.remove(escort.g);
+  if(escort){ scene.remove(escort.g); if(escort.halo) scene.remove(escort.halo); }
   mates.length = 0; flock = []; convoy = []; gathered = false; fullShown = false; rareShown = false;
   MATES.forEach((d,i)=>mates.push(new Mate(d,i)));
   escort = new Mate(ESCORT, -1);
+  for(const h of hawks) scene.remove(h.g);
+  hawks.length = 0; taken = []; scaredUntil = 0;
+  if(stage.hawks) for(let i=0;i<stage.hawks.nests.length;i++) hawks.push(new Hawk(i));
   updateMateHud();
 }
 function updateMateHud(){ $('mates').textContent = `${flock.length} / ${stage.maxFlock}`; }
@@ -3319,12 +4389,12 @@ function flockGrew(){
   const rare = mates.find(m=>m.def.rare);
   if(R && rare && !rareShown && !gathered && flock.length >= R.minFlock && flock.length < stage.maxFlock){
     rareShown = true;
-    const sp = stage.spots[R.spot];
+    const sp = stage.spots[rare.def.spot ?? R.spot];
     const a = Math.atan2(sp.z - bird.position.z, sp.x - bird.position.x);
     rare.spot = sp;
-    rare.g.position.set(sp.x + Math.cos(a)*160, 45, sp.z + Math.sin(a)*160);
+    rare.g.position.set(sp.x + Math.cos(a)*160, sp.y + 45, sp.z + Math.sin(a)*160);
     rare.g.visible = true; rare.state = 'arriving'; rare.vel.set(0,0,0);
-    setTimeout(()=>toast('遠くの岩に、光る羽が舞い降りた'), 400);
+    setTimeout(()=>toast(stage.rareMsg), 400);
   }
   if(flock.length === 4) setTimeout(()=>toast('群れの歌が遠くまで届くようになった'), 2400);
   if(!fullShown && flock.length >= stage.maxFlock) flockFull();
@@ -3350,7 +4420,7 @@ function escortAppear(){
   escort.isleSpot = {x, y:y+.02, z};
   escort.g.position.set(x - dx/d*30, y + 28, z - dz/d*30);
   escort.vel.set(0,0,0); escort.g.visible = true; escort.state = 'isleCall'; escort.play('flying', 0);
-  setTimeout(()=>toast(`島で ${nameOf(ESCORT)} が待っていた。歌いかけてみよう`), 1200);
+  setTimeout(()=>toast(stage.escortMsg(nameOf(ESCORT))), 1200);
 }
 /* sung to on the island: the guide goes back for everyone still out there.
    from here on nobody drops out of the flock. */
@@ -3365,6 +4435,179 @@ function gather(){
   const ch = Sound.chord().map(n=>{ while(n<79) n+=12; return n; });
   ch.forEach((m,i)=>setTimeout(()=>Sound.chirp(m, .9, 0, i%2, voiceCents(ESCORT)), 300+i*190));
   setTimeout(()=>toast(`${nameOf(ESCORT)} が、残った子たちを迎えに行った`), 900);
+}
+
+/* ============ the hawk ============
+   a stand-in: the bird model, big and dark. it rests on a peak, and now and then,
+   once the flock is past the meadow, comes over the flock calling. under cover it
+   cannot see you. it takes the last bird in the flock and carries it slowly toward
+   its nest: sing at it from close by and it flinches and lets go. too slow, and
+   that bird is gone for the day. the lead bird is never taken. */
+class Hawk {
+  constructor(i){
+    this.i = i;
+    this.g = new THREE.Group(); this.tilt = new THREE.Group(); this.g.add(this.tilt);
+    const m = skinClone(gltfSrc.scene), K = 2.6;
+    m.scale.setScalar(modelK*K); m.position.y = modelFoot*K;
+    m.traverse(o=>{ if(o.isMesh){ o.frustumCulled = false; o.material = o.material.clone(); o.material.map = null; o.material.color.setHex(0x4b4139); o.material.needsUpdate = true; } });
+    this.model = m; this.tilt.add(m); scene.add(this.g);
+    this.mixer = new THREE.AnimationMixer(m); this.acts = {};
+    for(const w of ['flying','glide','dive_in','dive','alert','hover']){
+      const c = gltfSrc.animations.find(c=>c.name.toLowerCase()===w); if(c) this.acts[w] = this.mixer.clipAction(c);
+    }
+    const H = stage.hawks, n = H.nests[i % H.nests.length];
+    // it circles over the ridge, not over the summit: kept low enough to come down on the flock in time
+    this.home = new THREE.Vector3(n[0], (stage.groundAt(n[0], n[2]) ?? 100) + 30, n[2]);
+    this.g.position.copy(this.home);
+    this.vel = new THREE.Vector3(); this.heading = 0; this.pitch = 0; this.roll = 0; this.ang = i*Math.PI;
+    this.state = 'away'; this.next = clock.elapsedTime + 10 + i*14; this.scare = 0; this.target = null;
+    this.play('glide', 0);
+  }
+  play(name, fade=.25){
+    const a = this.acts[name]; if(!a || this.cur===a) return;
+    a.reset(); a.setEffectiveWeight(1);
+    if(name==='dive_in'){ a.setLoop(THREE.LoopOnce,1); a.clampWhenFinished = true; } else a.setLoop(THREE.LoopRepeat, Infinity);
+    a.timeScale = name==='flying' ? .7 : 1;              // big wings beat slower
+    if(this.cur) a.crossFadeFrom(this.cur, fade, true);
+    a.play(); this.cur = a; this.curName = name;
+  }
+  steer(dt, T, maxSp, gain, turn=2.5, carry=null){
+    _v.copy(T).sub(this.g.position).multiplyScalar(gain);
+    if(carry) _v.add(carry);                             // matching the quarry's own speed, so closing in never stalls
+    if(_v.length() > maxSp) _v.setLength(maxSp);
+    this.vel.lerp(_v, Math.min(1, turn*dt));          // how quickly it can change course
+    this.g.position.addScaledVector(this.vel, dt);
+    const gh = stage.groundAt(this.g.position.x, this.g.position.z);
+    if(gh !== null && this.g.position.y < gh + 1.2){ this.g.position.y = gh + 1.2; if(this.vel.y < 0) this.vel.y = 0; }
+  }
+  face(dt){
+    const hs = Math.hypot(this.vel.x, this.vel.z);
+    const want = hs > .8 ? Math.atan2(this.vel.x, this.vel.z) : this.heading;
+    const dh = wrapA(want - this.heading);
+    this.heading += dh*Math.min(1, 3*dt);
+    this.roll += (THREE.MathUtils.clamp(dh*1.6,-.7,.7) - this.roll)*Math.min(1,3*dt);
+    this.pitch += (THREE.MathUtils.clamp(this.vel.y*.05,-.6,.5) - this.pitch)*Math.min(1,3*dt);
+    this.g.rotation.set(0,0,0); this.g.rotateY(this.heading); this.g.rotateX(-this.pitch);
+    this.tilt.rotation.z = this.roll*.7;
+  }
+  call(){
+    _v.copy(this.g.position).sub(camera.position); const d = _v.length();
+    _w.set(1,0,0).applyQuaternion(camera.quaternion);
+    const pan = _v.dot(_w)/Math.max(d,1), vol = 1/(1+d*.02);
+    Sound.chirp(62, vol, pan, 1, -40); setTimeout(()=>Sound.chirp(57, vol*.8, pan, 1, -40), 260);
+    scaredUntil = Math.max(scaredUntil, clock.elapsedTime + 5);
+  }
+  update(dt, now){
+    this.mixer.update(dt);
+    const P = bird.position, H = stage.hawks;
+    switch(this.state){
+    case 'away': {                        // circling over its peak, out of the way
+      this.ang += dt*.22;
+      _h.set(this.home.x + Math.cos(this.ang)*70, this.home.y, this.home.z + Math.sin(this.ang)*70);
+      this.steer(dt, _h, 11, 1); this.face(dt); this.play('glide', .4);
+      if(now < this.next || finished || finale || gathered || !flock.length || P.z < H.zone[0]) break;
+      if(hawks.some(h=>h!==this && h.state!=='away')) break;      // one at a time
+      // can it see you? never under cover; rarely when skimming the ground
+      const gh = stage.groundAt(P.x, P.z) ?? 0, low = !grounded && P.y - gh < 6;
+      if(hidden || (low && Math.random() < .6)){ this.next = now + 5; break; }
+      this.state = 'hunt'; this.huntT = 0; this.pass = P.z < H.zone[1];
+      this.call(); toast(this.pass ? '鷹の声がした' : '鷹が来る。木の下へ');
+      break;
+    }
+    case 'hunt': {                        // over the flock, calling, its shadow crossing the ground
+      this.huntT += dt;
+      _h.set(P.x, P.y + 20, P.z);
+      _h.addScaledVector(V, .8);                           // heads for where the flock is going, not where it was
+      this.steer(dt, _h, 52, 1.3, 6, V); this.face(dt); this.play('flying', .3);
+      if(this.huntT > 2.5 && !this.called2){ this.called2 = true; this.call(); }
+      if(hidden){ this.leave(now, '鷹は見失ったようだ'); break; }
+      const d = this.g.position.distanceTo(_h);
+      if(d < 10 || this.huntT > 18){
+        this.called2 = false;
+        if(this.pass){ this.leave(now); break; }
+        const t = flock.filter(m=>!m.def.rare).pop();
+        if(!t){ this.leave(now); break; }
+        this.target = t; this.state = 'strike'; this.strikeT = 0; this.play('dive_in', .1);
+      }
+      break;
+    }
+    case 'strike': {                      // the dive at the last bird in line
+      this.strikeT += dt; const t = this.target;
+      if(!t || !flock.includes(t) || hidden){ this.leave(now); break; }
+      _h.copy(t.g.position).addScaledVector(t.vel, .35);
+      this.steer(dt, _h, 60, 4, 8); this.face(dt);
+      if(this.curName !== 'dive_in' && this.curName !== 'dive') this.play('dive', .1);
+      if(this.curName === 'dive_in' && this.strikeT > .5) this.play('dive', .1);
+      if(this.g.position.distanceTo(t.g.position) < 3.6) this.catchMate(t, now);
+      else if(this.strikeT > 16) this.leave(now);
+      break;
+    }
+    case 'carry': {                       // circles with the bird for a while (catch it up here), then makes slowly for the nest
+      this.carryT += dt; const t = this.target;
+      if(this.carryT < H.circleTime){
+        this.ang += dt*.45;
+        _h.set(this.catchAt.x + Math.cos(this.ang)*22, this.catchAt.y + 6 + this.carryT*1.2, this.catchAt.z + Math.sin(this.ang)*22);
+        this.steer(dt, _h, 9, 1.2);
+      } else {
+        _h.copy(this.home); _h.y = Math.max(this.home.y, this.g.position.y + 6);
+        this.steer(dt, _h, 6.5, .5);
+      }
+      this.face(dt); this.play('flying', .3);
+      t.g.position.copy(this.g.position).y -= 1.5; t.vel.set(0,0,0);
+      t.heading = this.heading; t.g.rotation.set(0,0,0); t.g.rotateY(this.heading);
+      if(this.scare >= H.scareNeed) this.release(now, true);
+      else if(this.carryT > H.carryTime || this.g.position.distanceTo(this.home) < 20) this.release(now, false);
+      break;
+    }
+    case 'flinch': {                      // startled: a beat of hovering, then off
+      this.flinchT += dt;
+      this.vel.multiplyScalar(1 - Math.min(1, 3*dt)); this.g.position.addScaledVector(this.vel, dt); this.g.position.y += 1.5*dt;
+      this.play('alert', .15);
+      if(this.flinchT > .9) this.leave(now);
+      break;
+    }
+    case 'leave': {                       // back to its peak
+      _h.copy(this.home); _h.y += 10;
+      this.steer(dt, _h, 18, 1); this.face(dt); this.play('glide', .4);
+      if(this.g.position.distanceTo(_h) < 25 || Math.hypot(this.g.position.x-_h.x, this.g.position.z-_h.z) < 12){ this.state = 'away'; this.ang = Math.atan2(this.g.position.z-this.home.z, this.g.position.x-this.home.x); }
+      break;
+    }
+    }
+  }
+  leave(now, msg){
+    this.state = 'leave'; this.target = null;
+    this.next = now + stage.hawks.rest + Math.random()*stage.hawks.interval[1];
+    if(msg) toast(msg);
+  }
+  catchMate(t, now){
+    const k = flock.indexOf(t); if(k >= 0) flock.splice(k, 1);
+    t.state = 'caught'; t.hawk = this; t.play(t.acts.struggle ? 'struggle' : 'alert', .1);
+    this.state = 'carry'; this.carryT = 0; this.scare = 0; scaredUntil = Math.max(scaredUntil, now + 8); this.catchAt = this.g.position.clone(); this.ang = Math.atan2(this.g.position.z-this.catchAt.z, this.g.position.x-this.catchAt.x);
+    toast(`${nameOf(t.def)} が鷹に捕まった。近くで歌って追い払え`);
+    Sound.chirp(64, .9, 0, 1, -40);
+    updateMateHud();
+  }
+  release(now, saved){
+    const t = this.target; this.target = null;
+    if(saved){
+      t.state = 'follow'; flock.push(t); t.vel.set(0, -3, 0); t.play('flying', .2);
+      toast(`鷹がひるんだ。${nameOf(t.def)} が戻ってきた`);
+      this.state = 'flinch'; this.flinchT = 0;
+      this.next = now + stage.hawks.rest*1.5;
+    } else {
+      t.state = 'taken'; t.g.visible = false; taken.push(t);
+      toast(`${nameOf(t.def)} が連れ去られた…`);
+      this.leave(now);
+    }
+    updateMateHud();
+  }
+}
+// sung at from close by: the hawk takes fright a step at a time; a bigger flock sings louder
+function scareHawks(){
+  for(const h of hawks){
+    if(h.state !== 'carry' || h.carryT < stage.hawks.grace) continue;    // the first moments after the catch: nothing you sing reaches it
+    if(h.g.position.distanceTo(bird.position) < 40 + flock.length*2){ h.scare += 1 + Math.min(1.5, flock.length*.25); Sound.chirp(66, .5, 0, 1, -40); }
+  }
 }
 
 /* a knock costs the flock its last-joined bird, who heads for the
@@ -3425,6 +4668,7 @@ function sing(){
   }
   for(const m of mates) if(m.state==='waiting' && m.g.position.distanceTo(bird.position) < R && Math.random()<.4) m.chorus(midi, now, 0);
   if(escort && (escort.state === 'isleWait' || escort.state === 'isleCall') && escort.g.position.distanceTo(bird.position) < Math.min(R, 30)){ escort.chorus(midi, now, 0); gather(); }
+  scareHawks();
 }
 
 /* ---- finale ---- */
@@ -3509,19 +4753,39 @@ function finish(){
   for(const m of mates){
     const got = flock.includes(m);
     const ahead = !got && convoy.includes(m);
+    const lost = taken.includes(m);
     if(m.def.rare && !got && !ahead && m.state==='absent') continue;   // never seen: no hint it exists
     const li = document.createElement('li'); li.className = got ? '' : ahead ? 'ahead' : 'miss';
     const c = '#'+new THREE.Color(m.color).getHexString();
     const star = m.def.rare ? '<span class="star">✦</span>' : '';
     const nw = fresh.includes(m.def.id) ? '<span class="new">図鑑に登録</span>' : '';
-    li.innerHTML = got   ? `<i style="background:${c}"></i><span>${nameOf(m.def)}${star}${nw}<small>${m.def.trait}</small></span>`
-                 : ahead ? `<i style="background:${c}"></i><span>${nameOf(m.def)}${star}<small>先に渡った</small></span>`
+    li.innerHTML = got   ? `<i style="background:${c}"></i><span>${nameOf(m.def)}${star}${nw}<small>${m.def.trait}${m.def.species ? '　'+m.def.species : ''}</small></span>`
+                 : ahead ? `<i style="background:${c}"></i><span>${nameOf(m.def)}${star}<small>しるべと渡った</small></span>`
+                 : lost  ? `<i style="background:${c}"></i><span>${nameOf(m.def)}${star}<small>鷹に連れ去られた</small></span>`
                  :         `<i style="background:${c}"></i><span>？？？<small>まだ会えていない</small></span>`;
     ul.appendChild(li);
   }
+  $('result').querySelector('.day').textContent = STAGE_INFO[curStage].label;
+  $('result').querySelector('h2').textContent = stage.arriveTitle;
   $('rcount').innerHTML = `結んだ羽　${flock.length} / ${stage.maxFlock}` +
     (zukan.justUnlocked ? `<br><span class="unlock">${STAGE_INFO[zukan.justUnlocked].label} への道が開いた</span>` : '');
   startFinale();              // the result card comes up once they've sung
+}
+/* back to the title: the day is dropped, the birds put away, the title song comes back */
+function toTitle(){
+  $('result').classList.remove('on','fin');
+  finished = false; finale = null; canFinish = false; isleToast = false;
+  document.body.classList.remove('canFinish', 'ready');
+  $('gate').classList.remove('away');
+  for(const m of mates){ scene.remove(m.g); if(m.halo) scene.remove(m.halo); }
+  if(escort){ scene.remove(escort.g); if(escort.halo) scene.remove(escort.halo); }
+  mates.length = 0; flock = []; convoy = []; escort = null; gathered = false; fullShown = false; rareShown = false;
+  for(const h of hawks) scene.remove(h.g);
+  hawks.length = 0; taken = [];
+  if(hidden){ hidden = false; Sound.duck(false); }
+  reset();
+  Sound.switchTo('hajimari');
+  paintStages(); paintSkin();
 }
 function restartDay(){
   $('result').classList.remove('on','fin');
@@ -3551,7 +4815,7 @@ function rescueToRock(){
     else { m.g.position.set(x, best.y + 1.5, z); m.state = 'follow'; }
     m.vel.set(0,0,0); m.farT = 0;
   });
-  toast('休みの岩に降りた');
+  toast(`${stage.restName}に降りた`);
 }
 
 const _hv = new THREE.Vector3();
@@ -3566,9 +4830,9 @@ function updateHalos(dt){
     pHaloVis += ((hidden ? 0 : 1) - pHaloVis) * Math.min(1, 8*dt);
     pHalo.material.opacity = (.28 + .3*pulse) * pHaloVis;
   }
-  for(const m of mates){
+  for(const m of (escort ? [...mates, escort] : mates)){
     if(!m.halo) continue;
-    m.halo.visible = m.g.visible;
+    m.halo.visible = m.g.visible && (!m.def.escort || ['isleCall','isleWait','isleDone','escortIn','lead','waiting'].includes(m.state));
     if(!m.g.visible) continue;
     if(m.spine) m.spine.getWorldPosition(m.halo.position); else m.halo.position.copy(m.g.position).y += .45;
     const hidden = stage.blocks(camera.position, m.halo.position);
@@ -3579,10 +4843,14 @@ function updateHalos(dt){
 function mateTick(dt){
   const now = clock.elapsedTime;
   lossCool -= dt; singCool -= dt;
+  // cover: under leaves or in a bush the hawks cannot see you, and the song comes down a little
+  const hid = !finished && stage.hiddenAt(bird.position);
+  if(hid !== hidden){ hidden = hid; Sound.duck(hid); }
   for(const m of mates) m.update(dt, now);
+  for(const h of hawks) h.update(dt, now);
   if(escort) escort.update(dt, now);
   if(escort && fullShown && !gathered && !finished && escort.state === 'away'
-     && flock.length >= stage.maxFlock && stage.isGoal(bird.position.x, bird.position.z)) escortAppear();
+     && flock.length >= stage.maxFlock && !taken.length && stage.isGoal(bird.position.x, bird.position.z)) escortAppear();   // the guide only comes when nobody was carried off
   finaleTick(dt);
   updateNotes(dt, grounded ? null : V);
   if(!finale && grounded && current===clips.sing && now > singUntil) play('idle', .35);
@@ -3815,7 +5083,7 @@ let zTab = 'all';
 function zPaint(){
   // tabs: everything, then one per stage that has birds
   const tabs = $('zTabs'); tabs.innerHTML = '';
-  for(const [k,l] of [['all','すべて'], ...Object.keys(BIRDS).map(k=>[k, STAGE_INFO[k].short])]){
+  for(const [k,l] of [['all','すべて'], ...Object.keys(BIRDS).filter(k=>STAGE_INFO[k].ready).map(k=>[k, STAGE_INFO[k].short])]){
     const b = document.createElement('button'); b.textContent = l; b.classList.toggle('on', zTab===k);
     b.addEventListener('click', ()=>{ zTab = k; zPaint(); }); tabs.appendChild(b);
   }
@@ -3852,7 +5120,7 @@ function openZukan(){
 function closeZukan(){
   zCloseCase();
   zOpen = false; $('zukan').classList.remove('on');
-  Sound.switchTo('umi');
+  Sound.switchTo(document.body.classList.contains('ready') ? stage.bgm : 'umi');   // back to the day's song
   if(!document.body.classList.contains('ready')) paintSkin();
 }
 
@@ -3910,7 +5178,7 @@ function zOpenCase(def){
   const first = groups.findIndex(gr=>gr.label==='idle');
   if(box.children.length) box.children[Math.max(0,first)].click();
   zDef = def; zShowName();
-  $('zTrait').textContent = def.trait;
+  $('zTrait').textContent = def.trait + (def.species ? `　（${def.species}）` : '');
   const le = zukan.birds[def.id] || {};
   $('zStats').innerHTML = def.player
     ? `はじめて渡った日　${zukan.firstRun||'—'}<br>渡った回数　${zukan.runs||0}回<br>いちばん大きな群れ　${zukan.best||0}羽<br>先頭で渡った回数　${le.lead||0}回`
@@ -3937,10 +5205,10 @@ $('zLead').addEventListener('click', ()=>{
 function paintStages(){
   const box = $('stageSel'); box.innerHTML = '';
   for(const k in STAGE_INFO){
-    const I = STAGE_INFO[k], open = zukan.unlocked.includes(k), b = document.createElement('button');
-    b.innerHTML = `${I.label}<small>${!open ? '製品版で' : !I.ready ? '準備中' : (zukan.stages[k] ? `渡った回数 ${zukan.stages[k].clears}` : 'まだ渡っていない')}</small>`;
+    const I = STAGE_INFO[k], open = zukan.unlocked.includes(k) || DEV_OPEN, b = document.createElement('button');
+    b.innerHTML = `${I.label}<small>${!open ? 'Coming soon' : !I.ready ? '準備中' : (zukan.stages[k] ? `渡った回数 ${zukan.stages[k].clears}` : 'まだ渡っていない')}</small>`;
     b.disabled = !open || !I.ready; b.classList.toggle('on', k===curStage);
-    b.addEventListener('click', ()=>{ curStage = k; paintStages(); });
+    b.addEventListener('click', ()=>{ curStage = k; paintStages(); setTimeout(()=>ensureStage(k), 30); });   // build it while the title is up
     box.appendChild(b);
   }
   const ln = $('leadName'); if(ln) ln.textContent = nameOf(leadDef());
